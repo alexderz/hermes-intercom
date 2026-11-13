@@ -18,7 +18,7 @@ PACKAGE_NAME = "hermes_intercom_test"
 
 def load_plugin(home: Path):
     constants = ModuleType("hermes_constants")
-    setattr(constants, "get_hermes_home", lambda: str(home))
+    constants.get_hermes_home = lambda: str(home)
     sys.modules["hermes_constants"] = constants
     spec = importlib.util.spec_from_file_location(
         PACKAGE_NAME,
@@ -36,7 +36,7 @@ class ProtocolTests(unittest.TestCase):
     def setUp(self):
         import tempfile
 
-        self.tmp = tempfile.TemporaryDirectory(dir="/tmp")
+        self.tmp = tempfile.TemporaryDirectory()
         self.home = Path(self.tmp.name) / ".hermes"
         self.home.mkdir()
         self.plugin = load_plugin(self.home)
@@ -61,7 +61,6 @@ class ProtocolTests(unittest.TestCase):
                 from_cwd=from_cwd,
                 payload_extra=payload_extra,
             )
-            request_id = payload_extra["request_id"]
             self.plugin.inbox.resolve_ask(
                 payload_extra["request_id"],
                 "peer",
@@ -311,7 +310,7 @@ class ProtocolTests(unittest.TestCase):
         with mock.patch.object(
             self.plugin.inbox,
             "_peer_uid",
-            return_value=self.plugin.inbox.os.getuid() + 1,
+            return_value=getattr(self.plugin.inbox.os, "getuid", None)() + 1,
         ):
             worker = threading.Thread(target=self.plugin.inbox._serve, args=(server,))
             worker.start()
@@ -360,9 +359,9 @@ class ProtocolTests(unittest.TestCase):
     def test_spool_drain_uses_new_endpoint_not_stale_module_state(self):
         stale = self.home / "intercom" / "pending" / "stale.jsonl"
         stale.parent.mkdir(parents=True)
-        stale.write_text(json.dumps({"text": "wrong", "ts": 1}) + "\n")
+        stale.write_text(json.dumps({"text": "wrong", "ts": 1}) + "\n", encoding="utf-8")
         target = stale.parent / "target.jsonl"
-        target.write_text(json.dumps({"text": "right", "ts": 2}) + "\n")
+        target.write_text(json.dumps({"text": "right", "ts": 2}) + "\n", encoding="utf-8")
         self.plugin.inbox._state["meta"] = {"session_id": "stale"}
 
         self.plugin.inbox.start(name="lab", session_id="target")

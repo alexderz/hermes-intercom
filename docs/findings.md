@@ -1,5 +1,7 @@
 # Implementation findings
 
+> This document describes the legacy Unix-socket path of 0.2. Version 0.3 delivers through the gateway owner (see the README); this path is used only on a Hermes build without the owner client.
+
 Notes from building and testing this plugin against the real Hermes Agent
 codebase (fork majordave, main, Aug 2026). These are the non-obvious parts
 that issue #81885's design glosses over — recorded here so future implementers

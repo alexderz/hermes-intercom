@@ -1,7 +1,11 @@
 name: intercom
-version: 0.2.0
-description: "Local cross-session messaging: sessions discover each other and exchange plain-text messages via Unix sockets. Delivered mid-turn via steer or at next turn when idle."
+version: 0.3.0
+description: "Session-to-session messaging through the Hermes gateway owner: sessions discover each other and exchange plain-text messages, steered into a running turn or starting a turn when idle."
 author: "majordave"
 kind: standalone
 provides_tools:
   - intercom
+provides_hooks:
+  - post_llm_call
+  - pre_llm_call
+  - pre_api_request

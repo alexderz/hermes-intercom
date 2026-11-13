@@ -32,17 +32,14 @@ logger = logging.getLogger(__name__)
 
 _DIR_NAME = "intercom"
 _REGISTRY = "sessions"
-_MAX_MSG_CHARS = 8000
+# Message length, rate and dedupe caps are gone (README, "What changed from 0.2").
+# The pending cap stays only on this legacy inbox, which a build with the gateway
+# owner client never starts.
 _PENDING_CAP = 10
-_RATE_WINDOW_S = 60
-_RATE_MAX_PER_PEER = 6
-_DEDUPE_WINDOW_S = 120
 
 _lock = threading.Lock()
 _state: dict = {}          # session-scoped singleton state
 _pending_by_peer: dict[str, list[dict]] = {}   # peer_name -> [envelopes]
-_rate: dict[str, list[float]] = {}             # peer_name -> timestamps
-_dedupe: dict[str, list[tuple[int, float]]] = {}  # peer_name -> [(hash, ts)]
 
 
 def _human_view(header: str, body: str) -> str:
@@ -94,8 +91,8 @@ def _display_banner(human_text: str) -> None:
             return
         out.write("\n" + human_text + "\n\n")
         out.flush()
-    except Exception:
-        pass  # never crash delivery on a render problem
+    except Exception:  # health: allow BLE001 -- a render failure must not crash delivery
+        logger.debug("intercom banner was not printed")
 
 
 # ---------------------------------------------------------------------------
@@ -127,18 +124,32 @@ def _default_name() -> str:
     return f"{profile}-{cwd[:20]}-{os.getpid() % 1000:03d}"
 
 
+def _pid_alive(pid: int) -> bool:
+    """True when *pid* is still running.
+
+    ``psutil.pid_exists`` instead of ``os.kill(pid, 0)``, which signals the
+    process on Windows. If psutil cannot be imported, the entry stays.
+    """
+    try:
+        import psutil
+    except ImportError:
+        return True
+    return bool(psutil.pid_exists(pid))
+
+
 def sweep_stale() -> list[str]:
     """Remove registry entries whose PID is dead. Returns surviving names."""
     alive: dict[str, dict] = {}
     for path in sorted(_registry_dir().glob("*.json")):
         try:
-            meta = json.loads(path.read_text())
-            os.kill(int(meta["pid"]), 0)
+            meta = json.loads(path.read_text(encoding="utf-8-sig"))
+            if not _pid_alive(int(meta["pid"])):
+                raise ProcessLookupError(meta["pid"])
             alive[meta["name"]] = meta
         except (OSError, ValueError, KeyError):
             try:
-                meta0 = json.loads(path.read_text())
-            except Exception:
+                meta0 = json.loads(path.read_text(encoding="utf-8-sig"))
+            except (OSError, ValueError):
                 meta0 = {}
             sock = meta0.get("socket", "")
             if sock and os.path.exists(sock):
@@ -156,8 +167,8 @@ def _sanitize_boundary(text: str) -> str:
 
     Sender names and message bodies travel inside the INTERCOM wrapper; a
     malicious peer could embed ``[/INTERCOM MESSAGE]`` to break out of the
-    frame and have the trailing text read as ordinary context (upstream
-    analog: Walkie Talkie SEC-R2). Insert zero-width spaces into any
+    frame and have the trailing text read as ordinary context (the
+    Walkie Talkie plugin defends against the same thing). Insert zero-width spaces into any
     boundary-like tag so it no longer parses as one.
     """
     # Header forgery: a body line mimicking our new header format gets broken
@@ -232,8 +243,8 @@ def _deliver_local(text: str, *, display: bool = False) -> str:
         try:
             pq.put(text)
             return "submitted_as_turn"
-        except Exception:
-            pass
+        except Exception:  # health: allow BLE001 -- a queue rejection falls through to park or steer
+            logger.debug("intercom pending-input put failed")
 
     if agent is None:
         # No reachable agent in THIS process (e.g. the peer is a TUI/desktop
@@ -286,8 +297,7 @@ def _is_turn_running(agent) -> bool:
         v = getattr(agent, attr, None)
         if v is True:
             return True
-    # The CLI sets this while run_conversation executes.
-    cb = getattr(agent, "_tool_start_callback", None)
+    # A tool count means run_conversation is executing.
     return bool(getattr(agent, "_current_tool_count", None))
 
 
@@ -305,14 +315,14 @@ def set_turn_active(active: bool) -> None:
         path = _registry_dir() / f"{meta.get('session_id')}.json"
         if not path.exists():
             return
-        data = json.loads(path.read_text())
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
         data["turn_active"] = bool(active)
         data["turn_ts"] = time.time()
         tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(data))
+        tmp.write_text(json.dumps(data), encoding="utf-8")
         tmp.replace(path)
-    except Exception:
-        pass  # never break a turn over registry bookkeeping
+    except Exception:  # health: allow BLE001 -- registry bookkeeping must not break a turn
+        logger.debug("intercom turn flag was not published")
 
 
 def list_peers() -> tuple[list[dict], dict]:
@@ -338,8 +348,8 @@ def self_registry_turn_active() -> bool:
         if not sid:
             return False
         p = _registry_dir() / f"{sid}.json"
-        return bool(json.loads(p.read_text()).get("turn_active"))
-    except Exception:
+        return bool(json.loads(p.read_text(encoding="utf-8-sig")).get("turn_active"))
+    except (OSError, ValueError, TypeError, KeyError, ImportError, AttributeError):
         return False
 
 
@@ -348,10 +358,11 @@ def _load_peers() -> dict:
     peers = {}
     for path in sorted(_registry_dir().glob("*.json")):
         try:
-            meta = json.loads(path.read_text())
-            os.kill(int(meta["pid"]), 0)  # skip dead entries without sweeping
+            meta = json.loads(path.read_text(encoding="utf-8-sig"))
+            if not _pid_alive(int(meta["pid"])):
+                continue
             peers.setdefault(meta["name"], meta)
-        except Exception:
+        except (OSError, ValueError, TypeError, KeyError, AttributeError):
             continue
     return peers
 
@@ -489,7 +500,12 @@ def _exchange(meta: dict, payload: dict) -> dict:
 
 def send_to(target: str, message: str, from_name: str = "", from_cwd: str = "",
             payload_extra: dict | None = None, *, dedupe: bool = True) -> dict:
-    """Send `message` to peer `target`. Returns status dict."""
+    """Send `message` to peer `target`. Returns status dict.
+
+    ``dedupe`` is accepted so ``reply_to`` can still pass it. It does not
+    filter: twenty identical messages in a minute all go out (README, "What changed from 0.2").
+    """
+    del dedupe
     resolved_target = resolve_target(target)
     if not resolved_target.get("ok"):
         return resolved_target
@@ -498,26 +514,11 @@ def send_to(target: str, message: str, from_name: str = "", from_cwd: str = "",
     if int(meta.get("pid", -1)) == os.getpid():
         return {"ok": False, "error": "target is the current session"}
 
-    now = time.time()
-    with _lock:
-        window = [t for t in _rate.get(name, []) if now - t < _RATE_WINDOW_S]
-        if len(window) >= _RATE_MAX_PER_PEER:
-            return {"ok": False, "error": "rate limit reached for this peer"}
-        window.append(now)
-        _rate[name] = window
-        if dedupe:
-            seen = [(h, t) for h, t in _dedupe.get(name, []) if now - t < _DEDUPE_WINDOW_S]
-            digest = hash(message)
-            if any(h == digest for h, _ in seen):
-                return {"ok": False, "error": "identical message already sent recently"}
-            seen.append((digest, now))
-            _dedupe[name] = seen
-
     payload = {
         "type": "send",
         "from_name": from_name,
         "from_cwd": from_cwd,
-        "message": message[:_MAX_MSG_CHARS],
+        "message": message,
         **(payload_extra or {}),
     }
     reply = _exchange(meta, payload)
@@ -560,12 +561,22 @@ def _peer_uid(conn: socket.socket) -> int:
         return int(uid)
     raise PermissionError("peer uid authentication is unavailable on this platform")
 
+
+def _server_uid() -> int:
+    """This process's uid. PermissionError where the platform has none."""
+    getuid = getattr(os, "getuid", None)
+    if getuid is None:
+        raise PermissionError("peer uid authentication is unavailable on this platform")
+    return int(getuid())
+
+
 def _serve(conn: socket.socket) -> None:
     try:
         peer_uid = _peer_uid(conn)
-        if peer_uid != os.getuid():
+        server_uid = _server_uid()
+        if peer_uid != server_uid:
             raise PermissionError(
-                f"peer uid {peer_uid} does not match server uid {os.getuid()}"
+                f"peer uid {peer_uid} does not match server uid {server_uid}"
             )
         data = b""
         conn.settimeout(10)
@@ -574,8 +585,6 @@ def _serve(conn: socket.socket) -> None:
             if not chunk:
                 break
             data += chunk
-            if len(data) > _MAX_MSG_CHARS * 4:
-                break
         line = data.split(b"\n", 1)[0].decode(errors="replace").strip()
         req = json.loads(line) if line else {}
         req_type = req.get("type", "send")
@@ -594,7 +603,7 @@ def _serve(conn: socket.socket) -> None:
             return
         sender = _sanitize_name(req.get("from_name") or "unknown")
         header, body = _frame_parts(sender, req.get("from_cwd") or "?",
-                                    str(req.get("message", ""))[:_MAX_MSG_CHARS])
+                                    str(req.get("message", "")))
         text = f"{header}\n{body}"
         if req_type == "ask" and req.get("request_id"):
             # Tell the receiving agent this needs a reply, and how.
@@ -607,7 +616,7 @@ def _serve(conn: socket.socket) -> None:
             )
         status = _deliver_local(text)
         resp = {"ok": status not in ("rejected_pending_cap",), "status": status}
-    except Exception as exc:  # never crash the thread
+    except Exception as exc:  # health: allow BLE001 -- the thread must stay up; the warning is the record
         logger.warning("intercom inbox error: %s", exc)
         resp = {"ok": False, "error": str(exc)}
     try:
@@ -646,7 +655,7 @@ def start(name: str = "", session_id: str = "") -> None:
         "socket": sock_path,
         "started_at": time.time(),
     }
-    (reg / f"{sid}.json").write_text(json.dumps(meta))
+    (reg / f"{sid}.json").write_text(json.dumps(meta), encoding="utf-8")
 
     stop_evt = threading.Event()
 
@@ -655,7 +664,7 @@ def start(name: str = "", session_id: str = "") -> None:
         while not stop_evt.is_set():
             try:
                 conn, _ = srv.accept()
-            except socket.timeout:
+            except TimeoutError:
                 continue
             except OSError:
                 break
@@ -717,7 +726,7 @@ def _spool_append(text: str) -> None:
         os.chmod(f, 0o600)
         with os.fdopen(fd, "a", encoding="utf-8") as fh:
             fh.write(json.dumps({"text": text, "ts": time.time()}) + "\n")
-    except Exception:
+    except (OSError, TypeError, ValueError):
         pass
 
 
@@ -728,14 +737,14 @@ def _spool_drain(session_id: str = "") -> list[str]:
         if not f.exists():
             return []
         out = []
-        for line in f.read_text(encoding="utf-8").splitlines():
+        for line in f.read_text(encoding="utf-8-sig").splitlines():
             try:
                 out.append(str(json.loads(line)["text"]))
-            except Exception:
+            except (ValueError, TypeError, KeyError):
                 continue
         f.unlink(missing_ok=True)
         return out
-    except Exception:
+    except (OSError, ValueError):
         return []
 
 
