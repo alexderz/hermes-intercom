@@ -1,6 +1,6 @@
 name: intercom
-version: 0.3.0
-description: "Session-to-session messaging through the Hermes gateway owner: sessions discover each other and exchange plain-text messages, steered into a running turn or starting a turn when idle."
+version: 0.4.0
+description: "Session-to-session messaging through the Hermes gateway owner: sessions discover each other and exchange plain-text messages, including passive and keyed messages held until the next turn, or steered into a running turn or starting a turn when idle."
 author: "majordave"
 kind: standalone
 provides_tools:

@@ -246,7 +246,8 @@ class CliTestBase(unittest.TestCase):
 class PluginYamlTests(unittest.TestCase):
     def test_version_and_hooks(self):
         text = (PACKAGE_DIR / "plugin.yaml").read_text(encoding="utf-8-sig")
-        self.assertIn("\nversion: 0.3.0\n", text)
+        self.assertIn("\nversion: 0.4.0\n", text)
+        self.assertRegex(text, r"(?m)^description: .*passive.*keyed")
         self.assertIn("provides_tools:\n  - intercom\n", text)
         self.assertIn(
             "provides_hooks:\n  - post_llm_call\n  - pre_llm_call\n  - pre_api_request\n"

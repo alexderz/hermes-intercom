@@ -2,7 +2,7 @@
 
 Session-to-session messaging for [Hermes Agent](https://github.com/NousResearch/hermes-agent). One Hermes session can send a note to another, ask it a question, or wake it up, and a script can do the same from the shell.
 
-This is version 0.3. It delivers through the Hermes gateway owner, so it reaches every session kind the owner hosts, not only classic CLI sessions.
+This is version 0.4.0. It delivers through the Hermes gateway owner, so it reaches every session kind the owner hosts, not only classic CLI sessions. A message can be handed over now, or held as a passive or keyed note.
 
 ## Credits
 
@@ -14,7 +14,7 @@ This is version 0.3. It delivers through the Hermes gateway owner, so it reaches
 
 - **Delivery goes through the gateway owner.** Hermes 0.23 runs every chat surface of a profile (CLI, TUI, desktop and messaging platforms) inside the profile's gateway owner. intercom finds the owner, attaches to it, and uses the owner's own session verbs. It never starts an owner and never opens a TCP listener.
 - **Every session kind the owner hosts can be addressed**: local CLI/TUI/desktop sessions and messaging sessions (Telegram, Discord, Slack, ...). Cron, subagent and oneshot runs are listed when asked (`include_runs`).
-- **Three delivery modes**, each with a fallback:
+- **Three deliveries hand the message over now**, each with a fallback. `passive` does not: the note waits for the target's next turn (see [Passive delivery and keyed messages](#passive-delivery-and-keyed-messages)).
 
   | `delivery` | target running | if the owner rejects it |
   |---|---|---|
@@ -22,7 +22,7 @@ This is version 0.3. It delivers through the Hermes gateway owner, so it reaches
   | `queue` | runs after the current turn | — |
   | `interrupt` | redirects the running turn to the message | hard interrupt, then queued |
 
-- **Idle and closed sessions start a turn.** An idle session starts a turn with the message as its prompt. A session that is not open is reopened by the owner and starts a turn.
+- **Idle and closed sessions start a turn** for `steer`, `queue` and `interrupt`. An idle session starts a turn with the message as its prompt. A session that is not open is reopened by the owner and starts a turn.
 - One message has one submission id, which the owner admits once. Nothing is ever re-sent.
 
 The receipt says what happened: `steered`, `queued`, `interrupted` or `started`, and, when the mode was weaker than asked (for example a steer that became a queue), it says so.
@@ -85,12 +85,12 @@ Entries that are not `"<platform>:<id>"` strings are ignored with one warning an
 
 Sessions get one tool, `intercom`, with four actions:
 
-- `list`: sessions with id, title, project, last active and state. `query` filters on title or project; `limit` (default 30, newest first); `include_runs` adds cron, subagent and oneshot runs.
-- `send`: deliver `message` to `to`. `reply` is required.
+- `list`: sessions with id, title, project, last active and state. `query` filters on title or project; `limit` (default 30, newest first); `include_runs` adds cron, subagent and oneshot runs. `profile` lists another profile on this machine (see [Other profiles](#other-profiles)).
+- `send`: deliver `message` to `to`. `reply` is required. `delivery` includes `passive`; `key`, `within` and `profile` are optional (see [Passive delivery and keyed messages](#passive-delivery-and-keyed-messages), [Deadlines](#deadlines) and [Other profiles](#other-profiles)).
 - `ask`: deliver, then pause this turn until the other session answers with `reply` (`timeout` default 600 s, max 3600). Use it only when the turn cannot go on without the answer.
 - `reply`: answer an `ask`, with the `request_id` the ask carried.
 
-**`to`** resolves to exactly one session. The first rule that matches wins: an exact title, then a session id or id prefix, then `@<project-slug>` when project addressing is available. Several matches or none: nothing is sent and the receipt lists up to five candidates. Address follow-ups by **session id**: `list` and every receipt give it, and it stays valid after the session compacts.
+**`to`** resolves to exactly one session, or to `all` (see [Passive delivery and keyed messages](#passive-delivery-and-keyed-messages)). The first rule that matches wins: `all`, then an exact title, then a session id or id prefix, then `@<project-slug>` when project addressing is available. Several matches or none: nothing is sent and the receipt lists up to five candidates. Address follow-ups by **session id**: `list` and every receipt give it, and it stays valid after the session compacts. A session titled `all` is reached only by that id.
 
 **`reply`** (for `send`):
 
@@ -98,7 +98,7 @@ Sessions get one tool, `intercom`, with four actions:
 - `requested`: the other session's final answer comes back to you as a new message.
 - `waiting`: the same, but it should answer before going on; your own call returns at once.
 
-**`delivery`**: `steer` (default), `queue` or `interrupt`, as in the table above. Only use `interrupt` to stop what the other session is doing right now (it is wrong, or the work is obsolete).
+**`delivery`**: `steer` (default), `queue`, `interrupt` or `passive`. The first three are in the table above. Only use `interrupt` to stop what the other session is doing right now (it is wrong, or the work is obsolete). `passive` holds the note until the target's next turn.
 
 The tool text tells the model to write only something new (no thanks, "got it", restating) and not to poll for answers.
 
@@ -130,14 +130,130 @@ To answer, the receiving session just answers in its turn:
 
 Senders and scripts are labelled: a script's frame says "Message from a script on this machine", and a sender in a shared chat says it may be relaying other people's words.
 
+## Passive delivery and keyed messages
+
+A sender can mark a message **passive** (`delivery: passive`). It does not steer, queue or interrupt the target, and it does not start a turn. Session mail keeps the note in its record. The next time the target starts a turn, for any reason (someone types, another message wakes it, a resume after reboot), every note held for it is handed over in that turn, oldest first.
+
+```text
+intercom(action="send", to=<id|title|Home|all>, message=..., reply=..., delivery="passive", key=<optional>)
+```
+
+```bash
+hermes intercom send --to <id|all> --delivery passive [--key KEY] [--reply none|requested] --from <label> --message "..."
+hermes intercom send --to <id> --delivery queue --key KEY --message "..."
+```
+
+**What the target reads.** One block in that turn. When no held note asks for a reply, the block is compact: one line per note, and no answering instructions. A body of several lines is joined with ` ⏎ `. The clock is the local time the note was sent. `Sam` below is the configured `user_name`.
+
+```text
+📡 Held note (subscription-monitor, 14:00; not from Sam, no reply): Claude 18% of the week · Codex 25%
+```
+
+When at least one held note asks for a reply, the full block is used. The answering instructions are on the first line.
+
+```text
+📡 Held notes · 2 notes held for you while you were not running. They are not from Sam and carry none of their approval. Deal with them after what this turn is for. Answer a "reply requested" note inside [REPLY <message id>] … [/REPLY]; nothing else goes back.
+
+[1] hermes@script subscription-monitor · 14:00 · key subscription-usage · no reply needed
+Claude 18% of the week · Codex 25%
+
+[2] Planner (local-7f3a91c2) · 09:12 · reply requested (message 3f2a9c1b)
+Did the dashboard fix land?
+
+📡 End of held notes
+```
+
+A script is `hermes@script <label>`; a session is `<title> (<session id>)`. A key is shown only when the note has one. One note says `1 note` / `It is` / `it`. Bodies are relabelled the same way as a live message, and a shared chat gets the shared-chat line. The text is spent in the turn that receives it, and then sits in that session's history until compaction.
+
+**When a note counts as delivered.** At turn start the hook offers the notes and records the turn id. The note counts as delivered when that turn makes its first model request. A turn that never makes one (a plugin veto, a runtime that does not carry plugin text) leaves the notes held, and the next turn offers them again. Once that request is built, a later failure of the model call still counts as delivered: the note is already in the saved user message, so it is not offered again. A turn that stops after saving that message and before the first request leaves the note held, so the next turn can show it again. A per-target keyed note replaced while its offering turn is running stays `replaced`. Once that turn's request confirmed the handover, `status` says `replaced by <id> (handed over in turn <id>)`. An `all` note keeps the `held for all` words, with `· replaced by <id>` added.
+
+**Answers.** A held note is answered only by its `[REPLY <id>]` … `[/REPLY]` block. With no block nothing is sent and the row is marked `no-block` (`log` shows `reply: none (no [REPLY] block)`). An empty answer or `[SILENT]` sends nothing. A keyed queued message, in the turn its wake started, is answered like a live message.
+
+**Echo.** A per-target note to a private chat is echoed once, when the handover is confirmed. The echo is a held-note header, `📡 Held note · not from <user> · <sender> · HH:MM`, a blank line and the relabelled body. A note to `all` is not echoed. A local session is not echoed. A wake line is not echoed; the note it stands for is, at that confirmed handover.
+
+**Keys.** Optional free text on `passive` or `queue`. The value is trimmed, and a blank key is no key. Matching is case-sensitive. There is one namespace shared by every sender: a newer message with the same key replaces the held one, whoever sent it. Replacement is the same mode and the same target. A passive note replaces only a held passive note; a queued message replaces only a held queued message. The same key in the other mode does not replace it. "Same target" is the session's compaction lineage, so a note sent before a compaction is handed to the new tip, and a newer keyed note replaces the old one. A message with no key is never replaced. Use a topic name per kind of update (`subscription-usage` is the subscription monitor's).
+
+**Keyed queue.** `delivery: queue` with a `key`, while the target is busy: session mail holds the message, and Hermes's queue carries one short wake line. The line is `keyed update <key> from <sender>; the current version follows`, with the key and the sender label each wrapped in backticks. A newer message with that key replaces the held one. If the earlier wake is still outstanding (the owner took it, and no turn has been offered the row), the new message rides that wake. Otherwise it queues a wake of its own. When the current turn ends, the next turn carries the newest version, framed as a live message, because that turn exists for it. To an idle target a keyed queued message starts a turn at once, as `queue` does, so there is nothing left to replace. The receipt is `queued` when the target is busy (the CLI prints `queued (replaceable, key <key>)`) and `started` when it is idle. If the gateway does not take the wake, the receipt is `held` and the CLI prints `held (the gateway did not take its wake; rides its next turn, key <key>)`; the message is handed over at the next turn. After a gateway restart, a wake that never ran is gone with the owner's queue. The pending row is then handed over at the target's next turn as a held note.
+
+**`to: all`.** One passive keyed note for the conversation sessions of the sender's own profile. Each of them gets the newest version once, at its next turn, including a session that starts after the note was sent. Cron, subagent and oneshot runs do not get it, and the sender's own lineage does not (a compaction of the sender included). A per-target note goes to the session that was addressed, runs included. `all` is matched before ordinary addressing, so a session titled `all` is reached only by its session id. The row has address `all` and no target. Its stored result stays `pending` until a newer note with that key replaces it; each session's handover is kept on its own (see [The record](#the-record)). `profile` cannot be combined with `to: all`.
+
+**Receipt.** A passive send's receipt is `held`. Nothing has reached the target yet, so it does not say delivered. The CLI prints `held (until its next turn; it does not wake it)`, with `, key <key>` inside the parentheses when the note has a key. With `within` it prints `held (wakes by HH:MM if not run)` the same way (see [Deadlines](#deadlines)).
+
+**`status` and `log`.** For a per-target note the delivery words are `held`, `delivered <YYYY-MM-DD HH:MM:SS> (turn <id>)`, or `replaced by <id>`. For `all` they are `held for all · handed to N sessions`, and `· replaced by <id>` once it has been replaced. N is how many sessions have had that version confirmed. A keyed queued message that is still waiting is `queued (replaceable)`, then `delivered` or `replaced by <id>` the same way. `log` prefixes these with `passive:` or `queue:` and appends ` · key <key>`. The stored `result` while a note is waiting is `pending`, not `held` (see [The record](#the-record)).
+
+**Usage errors.** Refused before a message id exists. Nothing is recorded. The error is `usage` and `exit` is 2 (a `send` from the CLI exits 2). The refusal names the reason:
+
+- `key` with `steer` or `interrupt`: they hand the message over at once, so there is nothing held to replace. `key` works with `passive` and `queue`.
+- `key` with `ask`: the asker waits on that exact message, so a replaced ask would leave it waiting until it times out.
+- `ask` with `passive`: an ask waits at most an hour and a held note may wait days, so it would always time out.
+- `to: all` without `delivery: passive` and a `key`: an unkeyed or waking message to every session is a general notification, which session mail does not send.
+- `to: all` with a reply other than `none`: one note would ask every session to answer.
+- `reply: waiting` with `passive`: `waiting` asks the target to answer first, and a held note is dealt with after what its turn is for.
+
+On a Hermes build without the gateway owner, the tool refuses `passive` with `no-seam` (exit 4): passive needs the gateway, and the legacy inbox cannot hold a note. Nothing is sent.
+
+`within` has its own refusals (see [Deadlines](#deadlines)). `profile` has its own (see [Other profiles](#other-profiles)).
+
+Consent (`allow_gateway_injection`) is checked at send and again at handover. Off at send, the note is refused `injection-off` and nothing is held. Off at handover, a note already held stays held.
+
+## Choosing a delivery
+
+Choose the delivery by what the target must do and when:
+
+- **Act now** (a correction, a stop, a handoff it is waiting on): `steer`; `interrupt` only to stop obsolete work.
+- **Act after its current work**: `queue`. If you may send the same kind of update several times while it is busy (a build's state), add a `key` so only the newest one wakes it.
+- **Know, but not until it next works**: `passive`. Costs nothing until then and never pulls the target off its work.
+- **Repeated status** (usage meters, a build's current state, what is deployed): `passive` with a `key` per topic, so only the newest version is ever pending. Status every session should have: `to: all` with a key, a terse one-line body, and a new version only when the change matters to a reader (a threshold crossed, a decision-relevant value changed), not on every refresh.
+- **Requests, answers and one-time updates**: no key. Each is its own message and must not be replaced by the next one. A request you need answered soon is not passive.
+- Still never: forwarding, un-keyed notes to many sessions, status sent by waking delivery.
+
+## Other profiles
+
+`profile` on the tool's `send` and `list` names another Hermes profile on this machine. Without it, send and list stay in the sender's profile. Naming the sender's own profile is the same as leaving it off.
+
+`list` with `profile` lists that profile's sessions. `send` with `profile` delivers into one session there, by session id, exact title or `Home`. A bot is reached by its exact title:
+
+```text
+intercom(action="send", to="Bot Chat", profile="<bot profile>", message=..., reply="none")
+```
+
+There is no `--profile` flag. A script uses the profile the `hermes` command runs in:
+
+```bash
+hermes -p <name> intercom send --to "Bot Chat" --message "..."
+hermes -p <name> intercom list
+hermes -p <name> intercom status MESSAGE_ID
+hermes -p <name> intercom log
+```
+
+`status` and `log` read the record of the profile they run in. A message sent with `profile` is stored in the target profile's record, so its status is read there.
+
+The target profile's settings govern the delivery: its `allow_gateway_injection`, its `echo_chats` and `owner_user_ids`, and its `user_name` in the frame. The sender's chat scope is still read in the sender's profile. The row is written in the target profile, with `sender_profile` set (unset means the sender's own profile). Replies, echo, held notes and keyed queue are found by the target's own hooks, and a reply is sent back into the sender's profile. On a cross-profile send the frame names the sender `hermes@<profile>/<title>`, and the receipt names the target `<profile>/<title>`.
+
+Refused, with the reason:
+
+- `profile` with `to: all`, with `ask`, or with `@<project>`: error `usage`, `exit` 2, no message id, nothing recorded.
+  - `to: all` stays in the sender's own profile.
+  - `ask` waits in the asker's own process, and an answer from another profile would never find it. Use `send` with `reply: waiting`.
+  - `@<project>` is refused. Address a session in another profile by id, exact title or `Home`.
+- An unknown or deleted profile: error `unknown-profile`. There is no Hermes profile of that name on this machine. Nothing is recorded.
+- Intercom is not enabled in the target profile: error `profile-not-enabled`. Session mail is not enabled there, so its replies, echo and framing protection would not happen. Nothing is recorded.
+- The target's `allow_gateway_injection` is not exactly `true`: error `injection-off`. The refusal is recorded in the target profile. The sender's own consent is not the one that is checked.
+
+`unknown-profile` and `profile-not-enabled` come from the tool's `profile`; the CLI reaches another profile with `hermes -p` and never returns them.
+
+A `within` deadline on a note sent with `profile` is fired by the same sweep as any other deadline (see [Deadlines](#deadlines)).
+
 ## CLI
 
 `hermes intercom` is for scripts and the shell. It is an owner client itself, starts no turn of its own, and never uses the legacy socket.
 
 ```bash
 hermes intercom send --to local-7f3a91c2 --message "Backup finished." [--reply none|requested|waiting] \
-    [--delivery steer|queue|interrupt] [--from nightly-backup] [--json]
+    [--delivery steer|queue|interrupt|passive] [--key KEY] [--within MINUTES] [--from nightly-backup] [--json]
 hermes intercom send --to "Planner" --file report.txt        # or --file - for stdin
+hermes intercom send --to all --delivery passive --key subscription-usage --reply none \
+    --from subscription-monitor --message "Claude 18% of the week"
 hermes intercom list [--include-runs] [--query TEXT] [--limit N] [--json]
 hermes intercom status MESSAGE_ID [--json]
 hermes intercom log [--to ADDRESS] [--from LABEL] [--since 30s|15m|24h|7d] [--json]
@@ -153,9 +269,9 @@ Exit codes:
 
 | code | meaning |
 |---|---|
-| 0 | delivered (or, for `list`/`log`/`status`, done) |
+| 0 | accepted (a `send`, including one whose receipt is `held` or `queued`; or `list` / `log` / `status` / `wake-due` finished) |
 | 1 | `status`: no message with that id |
-| 2 | usage error |
+| 2 | usage error (error `usage` for a refused combination, nothing recorded; also a bad command argument) |
 | 3 | not sent: bad input or address (`reply-missing`, `empty`, `ambiguous`, `unknown`, `own-session`, `project-addressing-unavailable`, `no-owner-set`) |
 | 4 | refused (`not-addressable`, `injection-off`, `refused-by-owner`, `no-seam`) |
 | 5 | the owner is not reachable (`no-owner`, `owner-restarting`, `not-reachable`) |
@@ -173,12 +289,44 @@ Exit codes:
   - A message to a **private** chat is also posted into that chat (the **echo**: header line and body, escaped for the platform), so you see what your session was told. It is posted once, from the target's own turn. Platforms with an escaper: Telegram, Discord, Slack, ntfy; any other platform gets no echo and one warning.
   - A **shared** chat never gets an echo, because other people read it. Its frame carries a line saying the chat is shared, and a reply from a session in a shared chat sends only its `[REPLY]` block.
   - Sending to a shared chat is allowed: that is the operator's choice. The frame tells the target who else reads.
-- **The record.** Every message, receipt and reply is stored in one SQLite file, `plugin-data/intercom/record.db` in the profile. The directory is `0700`; the database and its `-wal`/`-shm` files are `0600`, created owner-only on first open and re-checked on every open. Nothing is pruned. `status` and `log` read it.
-- **Consent** (`allow_gateway_injection`) is checked on every delivery, read fresh from the config.
+- **The record.** Every message, receipt and reply is stored as described in [The record](#the-record). `status` and `log` read it.
+- **Consent** (`allow_gateway_injection`) is checked on every delivery, read fresh from the config, and again when a held note is handed over.
+
+## The record
+
+Every message, receipt and reply is stored in one SQLite file, `plugin-data/intercom/record.db` in the profile the message belongs to. A send with `profile` is stored in the target profile. The directory is `0700`; the database and its `-wal`/`-shm` files are `0600`, created owner-only on first open and re-checked on every open. Nothing is pruned. `status` and `log` read it. An older file gains the columns below from a guarded `ALTER TABLE` on open, and gains `note_seen` if it has none.
+
+A passive note and a keyed queued message are inserted with `result` `pending`. A per-target handover sets `delivered_at`, and `result` `delivered` unless the row is already `replaced` (then it stays `replaced`). Replacement sets `result` `replaced` and `detail` `replaced by <id>`. `status` says `held` for a pending passive note; that word is not the stored `result`. A live message the owner applied as `queue` stores `result` `held`: a plain `queue` with no key, or a `steer` the owner rejected (queued after the turn). One the owner delivered into the running turn, interrupted (including a hard interrupt whose message is then queued), or that started a turn, stores `delivered`. An `all` row stays `pending` until it is replaced, and its `delivered_at` stays unset. Each session's handover of that note is a row in `note_seen`.
+
+Columns added for passive notes, keys, profiles and deadlines:
+
+| column | what it stores |
+|---|---|
+| `note_key` | the key, or unset |
+| `offered_turn` | the turn id a per-target note was offered to. An `all` note records that turn on `note_seen` instead |
+| `sender_profile` | the sender's profile when the target is a different profile; unset means the same profile |
+| `wake_admission` | submission id of a keyed-queue or deadline wake line |
+| `wake_instance` | the owner instance that took that wake; a marker from another instance is a wake the restart dropped |
+| `wake_at` | deadline (`created_at` plus `within` minutes), or unset |
+| `wake_claimed_at` | when the deadline sweep claimed the wake |
+| `wake_turn` | the turn that consumed the wake |
+| `woken_at` | when that turn started |
+
+`note_seen` tracks `all`, one row per lineage root and key:
+
+| column | what it stores |
+|---|---|
+| `root_id` | the lineage root, or the session id when it has no lineage row |
+| `note_key` | the key |
+| `message_id` | the `all` version offered to that lineage |
+| `turn_id` | the turn it was offered in |
+| `delivered_at` | when that turn's first model request confirmed it; unset until then |
+
+The primary key is `(root_id, note_key)`. `handed to N` counts rows for that message id whose `delivered_at` is set.
 
 ## Deadlines
 
-A per-target passive note can carry a deadline: `within` (whole minutes, at least 5) on the tool's `send`, or `--within MINUTES` on the CLI. The note is held as usual and handed over at the target's next turn. If it is still held when the deadline passes, the target is woken once, through Hermes's queue, and that turn carries the note together with any other held notes. A note delivered earlier causes no wake. The receipt reads `held (wakes by HH:MM if not run)`; `status` shows `wakes by HH:MM`, then `woken <time> (turn <id>)` once the wake's turn has started. A keyed note replaced before its deadline takes the new note's `within`, or none if the new one has none.
+A per-target passive note can carry a deadline: `within` (whole minutes, at least 5) on the tool's `send`, or `--within MINUTES` on the CLI. The note is held as usual and handed over at the target's next turn. If it is still held when the deadline passes, the target is woken once, through Hermes's queue, and that turn carries the note together with any other held notes. A note delivered earlier causes no wake. The CLI receipt reads `held (wakes by HH:MM if not run)`, with `, key <key>` before the closing parenthesis when the note has a key. `status` shows `held · wakes by HH:MM`, then `held · woken <time> (turn <id>)` once the wake's turn has started, and `delivered <time> (turn <id>) · woken <time> (turn <id>)` once that turn's first model request confirms the note. A keyed note replaced before its deadline takes the new note's `within`, or none if the new one has none.
 
 These are refused before anything is recorded (CLI exit 2), with the reason:
 
@@ -188,7 +336,13 @@ These are refused before anything is recorded (CLI exit 2), with the reason:
 
 Who fires it: the gateway itself, at the first kanban dispatcher tick after the deadline (`kanban.dispatch_interval_seconds`, 60 s by default; the first tick runs about 5 s after the gateway starts, so a deadline that passed while it was down fires then). No job is installed. Nothing fires while `hermes pause` is engaged; deadlines that came due meanwhile fire after resume. One sweep covers every profile on the machine whose config enables intercom, so deadlines on notes sent to another profile (`profile`) are fired by the same sweep.
 
-With `kanban.dispatch_in_gateway: false`, or with intercom disabled in the default profile, the gateway does not run the sweep. Deadlines then fire only when `hermes intercom wake-due` runs. It runs the same sweep once in the foreground; the operator may schedule it, and nothing schedules it for you.
+With `kanban.dispatch_in_gateway: false`, or with intercom disabled in the default profile, the gateway does not run the sweep. Deadlines then fire only when `hermes intercom wake-due` runs in a profile where intercom is enabled. Plugin commands are registered only for plugins that profile has enabled, so the command has to run there: a bare `hermes intercom wake-due` in a default profile that has intercom disabled is an unknown subcommand and fires nothing. When the default profile has intercom enabled, the command is `hermes intercom wake-due`. Otherwise name a profile that has it enabled:
+
+```text
+* * * * * hermes -p <a profile with intercom enabled> intercom wake-due
+```
+
+It runs the same sweep once in the foreground, for every profile, and prints nothing. One such entry covers every profile, including notes sent with `profile`, so there is no need for one entry per profile. A cron environment needs `hermes` on `PATH` (or an absolute path) and the same `HERMES_HOME` as the gateway. Nothing in the plugin creates that schedule.
 
 ## Reboots
 
@@ -210,6 +364,12 @@ hermes intercom resume-after-reboot
 
 It waits up to five minutes for the owner, then queues one message to each recorded session; idle or closed sessions start a turn. When the record is missing or older than `--max-age` (default 6h), it wakes sessions whose turn was still open in the fifteen minutes before boot. Boot time is read from `/proc/stat` (Linux). Each session gets at most one of these messages per boot; a second run in the same boot sends nothing.
 
+## What changed in 0.4
+
+- `passive` holds a note until the target's next turn. A `key` keeps the newest version, `to: all` gives one version to the conversation sessions of the sender's profile, and `within` wakes a per-target note that is still held when its deadline passes.
+- A `key` on `queue` keeps only the newest update while the target is busy. Hermes's queue carries the wake; the record carries the text.
+- `profile` on `send` and `list` reaches a session in another profile on this machine, including a bot by the exact title `Bot Chat`.
+
 ## What changed from 0.2
 
 - Delivery goes through the gateway owner instead of a per-session Unix socket, so TUI, desktop and messaging sessions are reachable, and an idle or closed session starts a turn.
@@ -220,7 +380,7 @@ It waits up to five minutes for the owner, then queues one message to each recor
 
 - Sessions open in the admin dashboard are not addressable; the receipt says so (`not-addressable`).
 - `@project` addressing needs a projects plugin that keeps `projects.db` with an `owner_session_id` column, named in `project_plugin` and enabled. Without it `@…` is refused and the tool does not offer it.
-- Same machine and same profile only. Cross-machine messaging is out of scope.
+- Same machine only. A session in another profile on this machine is reached with `profile` (see [Other profiles](#other-profiles)). Cross-machine messaging is out of scope.
 - The plugin depends on Hermes internals listed under Requirements.
 
 ## Development
