@@ -9,3 +9,4 @@ provides_hooks:
   - post_llm_call
   - pre_llm_call
   - pre_api_request
+  - on_kanban_dispatch_tick

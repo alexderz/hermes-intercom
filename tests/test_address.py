@@ -523,16 +523,18 @@ class AddressTests(unittest.TestCase):
         try:
             ctx = _Ctx()
             plugin.register(ctx)
-            # The reply hook, the echo hooks and the held-note hooks: with inbound "never" no
-            # legacy drain is registered.
+            # The reply hook, the echo hooks, the held-note hooks and the deadline tick: with
+            # inbound "never" no legacy drain is registered.
             self.assertEqual([hook[0] for hook in ctx.hooks],
                              ["post_llm_call", "pre_llm_call", "pre_api_request",
-                              "pre_llm_call", "pre_api_request"])
+                              "pre_llm_call", "pre_api_request", "on_kanban_dispatch_tick"])
             echo = sys.modules[plugin.__name__ + ".echo"]
             passive = sys.modules[plugin.__name__ + ".passive"]
+            deadline = sys.modules[plugin.__name__ + ".deadline"]
             self.assertEqual([hook[1] for hook in ctx.hooks[1:]],
                              [echo.on_pre_llm_call, echo.on_pre_api_request,
-                              passive.on_pre_llm_call, passive.on_pre_api_request])
+                              passive.on_pre_llm_call, passive.on_pre_api_request,
+                              deadline.on_dispatch_tick])
             self.assertIn(
                 "@<project-slug> (that project's owner session)",
                 ctx.tools[0]["schema"]["description"],

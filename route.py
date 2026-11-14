@@ -36,6 +36,10 @@ row lands in the target's record (``sender_profile`` set) and the target's confi
 consent, chat scope and the user name. The sender label reads ``<profile>/<title>`` and the
 receipt names the target ``<profile>/<title>``. The sender's own profile is no ``profile``.
 
+A deadline (``within``, passive.md P7): whole minutes, at least 5, on a per-target passive note
+only; anything else is a usage refusal. The row gets ``wake_at = created_at + within * 60``; the
+receipt says when it wakes. ``deadline.py`` fires it.
+
 Refusals of steps 0-3 are recorded as ``delivery_path='refused'`` rows; ``reply-missing`` and the
 usage refusals are not.
 
@@ -111,6 +115,12 @@ PROFILE_NOT_ENABLED = ("Nothing was sent: session mail is not enabled in profile
                        "replies, echo and framing protection would not happen there.")
 INJECTION_OFF_IN = ("Not delivered: intercom may not deliver messages in Hermes profile {name} "
                     "(allow_gateway_injection is off). Nothing was sent.")
+WITHIN_WITH_ALL = ("Nothing was sent: to: all cannot take within. A deadline on a note to all "
+                   "would wake every session.")
+WITHIN_WITH_LIVE = ("Nothing was sent: within works only with passive. {delivery} hands the "
+                    "message over at once, so there is nothing to wake the target for later.")
+WITHIN_INVALID = ("Nothing was sent: within is a whole number of minutes, at least {minimum}.")
+MIN_WITHIN = 5
 PASSIVE_WAITING = ("Nothing was sent: passive cannot use reply: waiting. waiting asks the target "
                    "to answer first, but a held note is dealt with after what its turn is for. "
                    "Use reply: requested, or steer.")
@@ -127,7 +137,7 @@ def cold_start_sentence(title: str, message_id: str) -> str:
 
 def send(sender, to, message, *, ctx, delivery="steer", reply_mode=None, kind="send",
          reply_to=None, script=False, lister=None, on_inserted=None, key=None,
-         profile=None) -> dict:
+         profile=None, within=None) -> dict:
     """Send *message* from *sender* to the one session *to* resolves to. Returns the receipt.
 
     *sender* is the calling session's id, or with ``script=True`` a script label (the CLI, which
@@ -136,7 +146,9 @@ def send(sender, to, message, *, ctx, delivery="steer", reply_mode=None, kind="s
     tells a cold start from an idle one. *on_inserted* is called with the message id and the
     target session once the row exists, before delivery (the ``ask`` waiter). *key* (with
     ``passive`` or ``queue``) lets a newer message with the same key replace a held one.
-    *profile* names another Hermes profile on this machine to deliver into.
+    *profile* names another Hermes profile on this machine to deliver into. *within* (minutes,
+    passive only) is the note's deadline: the sweep in ``deadline.py`` wakes the target then if
+    the note is still held.
     """
     passive = delivery == PASSIVE
     if not passive and delivery not in client.DELIVERIES:
@@ -149,7 +161,8 @@ def send(sender, to, message, *, ctx, delivery="steer", reply_mode=None, kind="s
     if not (reply_mode in REPLY_MODES or (reply_mode == "optional" and reply_to)):
         return receipt.refused("reply-missing", REPLY_MISSING, reply=None)
     profile = profiles.other(profile)
-    usage = _usage_error(delivery, key, to_all, reply_mode, kind, profile=profile, to=to)
+    usage = _usage_error(delivery, key, to_all, reply_mode, kind, profile=profile, to=to,
+                         within=within)
     if usage:
         refused = receipt.refused("usage", usage)
         refused["exit"] = 2
@@ -166,6 +179,9 @@ def send(sender, to, message, *, ctx, delivery="steer", reply_mode=None, kind="s
                sender_session_id=who.session_id, address=to if isinstance(to, str) else "",
                body=body, reply_mode=reply_mode, requested=delivery, in_reply_to=reply_to,
                note_key=key)
+    if within is not None:
+        row["created_at"] = time.time()
+        row["wake_at"] = row["created_at"] + _minutes(within) * 60
     steps = dict(sender=sender, to=to, ctx=ctx, delivery=delivery, reply_mode=reply_mode,
                  kind=kind, reply_to=reply_to, script=script, lister=lister,
                  on_inserted=on_inserted)
@@ -280,10 +296,11 @@ def _steps(receipt, row, who, *, sender, to, ctx, delivery, reply_mode, kind, re
     return receipt.error(detail, _error_sentence(detail, outcome.get("code"), shown, message_id))
 
 
-def frame_stored(row: dict, ctx) -> str:
+def frame_stored(row: dict, ctx, *, body=None, reply_mode=None) -> str:
     """The live frame of a stored row, as its send would have framed it (sanitised).
 
-    For a keyed queued message handed over in its wake's turn: that turn exists for it.
+    For a keyed queued message handed over in its wake's turn: that turn exists for it. With
+    *body* and *reply_mode*, another text framed as this row (a deadline note's wake line).
     """
     if row.get("sender_source") == SCRIPT_SOURCE or not row.get("sender_session_id"):
         who = _Who.script(row.get("sender_label"))
@@ -292,7 +309,8 @@ def frame_stored(row: dict, ctx) -> str:
     else:
         who = _Who.session(row["sender_session_id"])
     sender_scope = None if who.kind == "script" else row.get("sender_chat_scope")
-    return _framed(row["id"], who, row.get("body") or "", ctx=ctx, reply_mode=row["reply_mode"],
+    text = (row.get("body") or "") if body is None else body
+    return _framed(row["id"], who, text, ctx=ctx, reply_mode=reply_mode or row["reply_mode"],
                    scopes=(sender_scope, row.get("target_session_id"), row.get("target_chat_scope"),
                            row.get("target_title") or row.get("target_session_id")))
 
@@ -321,9 +339,18 @@ def header_sha(text: str, message_id: str) -> str:
 # ── internals ────────────────────────────────────────────────────────────────
 
 
-def _usage_error(delivery, key, to_all, reply_mode, kind, *, profile=None, to=None) -> str | None:
+def _usage_error(delivery, key, to_all, reply_mode, kind, *, profile=None, to=None,
+                 within=None) -> str | None:
     """The reason a combination cannot work, or None. Checked before a message id exists."""
     passive = delivery == PASSIVE
+    if within is not None:
+        if to_all:
+            return WITHIN_WITH_ALL
+        if not passive:
+            return WITHIN_WITH_LIVE.format(delivery=delivery)
+        minutes = _minutes(within)
+        if minutes is None or minutes < MIN_WITHIN:
+            return WITHIN_INVALID.format(minimum=MIN_WITHIN)
     if profile is not None:
         if to_all:
             return PROFILE_WITH_ALL
@@ -344,6 +371,24 @@ def _usage_error(delivery, key, to_all, reply_mode, kind, *, profile=None, to=No
     if passive and reply_mode == "waiting":
         return PASSIVE_WAITING
     return None
+
+
+def _minutes(within) -> int | None:
+    """*within* as whole minutes (an integer, or a string of digits), else None."""
+    if isinstance(within, bool):
+        return None
+    if isinstance(within, int):
+        return within
+    if isinstance(within, float) and within.is_integer():
+        return int(within)
+    if isinstance(within, str) and within.strip().isdigit():
+        return int(within.strip())
+    return None
+
+
+def wake_clock(stamp) -> str:
+    """``HH:MM`` local time of a deadline, as the receipt and status show it."""
+    return time.strftime("%H:%M", time.localtime(stamp))
 
 
 def _framed(message_id, who, body, *, ctx, reply_mode, scopes, interrupt=False, kind="send",
@@ -421,6 +466,10 @@ def _hold(receipt, row, who, *, lineage) -> dict:
     else:
         sentence = (f'Message {message_id} is held for "{receipt.target_title}" until its next '
                     "turn. It does not wake it.")
+        if row.get("wake_at") is not None:
+            sentence = (f'Message {message_id} is held for "{receipt.target_title}" until its next '
+                        f"turn. If that has not run by {wake_clock(row['wake_at'])}, it is woken "
+                        "then.")
     parts = [sentence]
     if replaced:
         parts.append(f"It replaces held message {', '.join(replaced)} (key {row['note_key']}).")
@@ -430,6 +479,7 @@ def _hold(receipt, row, who, *, lineage) -> dict:
     fields = receipt.done("held", " ".join(part for part in parts if part))
     fields["key"] = row.get("note_key")
     fields["replaced"] = replaced
+    fields["wake_at"] = row.get("wake_at")
     return fields
 
 
