@@ -66,13 +66,21 @@ def deliver_sync(target: str, text: str, delivery: str, submission_id: str) -> d
     """Deliver *text* to session *target* using the mode table at the top
     of this module.
 
-    Returns ``{"ok": True, "applied", "applied_detail", "admission_id"}``; ``admission_id`` is
-    ``prompt.submit``'s id when the sequence ended in a submit, else ``None``. On failure:
+    Returns ``{"ok": True, "applied", "applied_detail", "admission_id", "instance_id"}``;
+    ``admission_id`` is ``prompt.submit``'s id when the sequence ended in a submit, else ``None``;
+    ``instance_id`` is the discovered owner's (``GatewayEndpoint.instance_id``). On failure:
     ``{"ok": False, "error": <detail>, "code": <owner code or None>, "exit", "message"}``.
     """
     if delivery not in DELIVERIES:
         raise ValueError(f"delivery must be one of {', '.join(DELIVERIES)}")
     return _run(_deliver, target, text, delivery, submission_id)
+
+
+def owner_instance() -> str | None:
+    """The running owner's ``instance_id`` from read-only discovery, or None when there is none."""
+    endpoint, failure = _discover()
+    instance = getattr(endpoint, "instance_id", None) if failure is None else None
+    return instance if isinstance(instance, str) and instance else None
 
 
 def list_sessions(scope: str = "live", picker: bool = False) -> dict:
@@ -176,6 +184,9 @@ async def _deliver(target, text, delivery, sub_id):
         async with connect_gateway(endpoint) as client:
             owner.client = client
             result = await owner.apply(delivery)
+            if result.get("ok") is True:
+                instance = getattr(endpoint, "instance_id", None)
+                result["instance_id"] = instance if isinstance(instance, str) else None
     except GatewayRPCError as exc:
         if result is None:
             result = _refusal(exc)

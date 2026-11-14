@@ -19,7 +19,9 @@ MODULE_NAME = "hermes_intercom_client_test"
 
 # Planted in every handle field the client must not read, and in every exception text.
 LEAK = "LEAKMARK"
-ENDPOINT = SimpleNamespace(api_origin=f"http://127.0.0.1:9/{LEAK}", instance_id=LEAK)
+# The instance id is returned with every delivery (a wake marker names it); it carries no secret.
+INSTANCE = "inst-1"
+ENDPOINT = SimpleNamespace(api_origin=f"http://127.0.0.1:9/{LEAK}", instance_id=INSTANCE)
 HOME = contextvars.ContextVar("fake_hermes_home", default="/nonexistent/default-home")
 
 
@@ -167,7 +169,7 @@ class ClientTests(unittest.TestCase):
                 self.owner = FakeOwner(session_resume=[handle(False)], prompt_submit=[submitted("adm-start")])
                 result = self.deliver(delivery)
                 self.assertEqual(result, {"ok": True, "applied": "start", "applied_detail": None,
-                                          "admission_id": "adm-start"})
+                                          "admission_id": "adm-start", "instance_id": INSTANCE})
                 self.assertEqual(self.owner.calls, [
                     ("session.resume", {"session_id": "s1", "omit_messages": True}),
                     ("prompt.submit", {"session_id": "s1", "text": "📡 hello", "submission_id": "intercom-m1"}),
@@ -176,14 +178,14 @@ class ClientTests(unittest.TestCase):
     def test_queue_on_running_target_is_a_queued_submit(self):
         self.script(session_resume=[handle(True)], prompt_submit=[submitted("adm-q")])
         result = self.deliver("queue")
-        self.assertEqual(result, {"ok": True, "applied": "queue", "applied_detail": None, "admission_id": "adm-q"})
+        self.assertEqual(result, {"ok": True, "applied": "queue", "applied_detail": None, "admission_id": "adm-q", "instance_id": INSTANCE})
         self.assertEqual(self.owner.calls[1], ("prompt.submit", {
             "session_id": "s1", "text": "📡 hello", "submission_id": "intercom-m1", "queued": True}))
 
     def test_steer_taken_by_session_steer(self):
         self.script(session_resume=[handle(True, 11)], session_steer=[ack("queued", 11)])
         result = self.deliver("steer")
-        self.assertEqual(result, {"ok": True, "applied": "steer", "applied_detail": None, "admission_id": None})
+        self.assertEqual(result, {"ok": True, "applied": "steer", "applied_detail": None, "admission_id": None, "instance_id": INSTANCE})
         self.assertEqual(self.owner.calls[1], ("session.steer", {
             "session_id": "s1", "text": "📡 hello", "execution_generation": 11}))
         self.assertEqual(self.owner.methods(), ["session.resume", "session.steer"])
@@ -191,7 +193,7 @@ class ClientTests(unittest.TestCase):
     def test_steer_rejected_falls_back_to_queued_submit(self):
         self.script(session_resume=[handle(True)], session_steer=[ack("rejected")], prompt_submit=[submitted("adm-sq")])
         result = self.deliver("steer")
-        self.assertEqual(result, {"ok": True, "applied": "queue", "applied_detail": None, "admission_id": "adm-sq"})
+        self.assertEqual(result, {"ok": True, "applied": "queue", "applied_detail": None, "admission_id": "adm-sq", "instance_id": INSTANCE})
         self.assertEqual(self.owner.methods(), ["session.resume", "session.steer", "prompt.submit"])
         self.assertIs(self.owner.calls[2][1]["queued"], True)
 
@@ -199,7 +201,7 @@ class ClientTests(unittest.TestCase):
         self.script(session_resume=[handle(True, 4)], session_redirect=[ack("redirected", 4)])
         result = self.deliver("interrupt")
         self.assertEqual(result, {"ok": True, "applied": "interrupt", "applied_detail": "redirect",
-                                  "admission_id": None})
+                                  "admission_id": None, "instance_id": INSTANCE})
         self.assertEqual(self.owner.calls[1], ("session.redirect", {
             "session_id": "s1", "text": "📡 hello", "execution_generation": 4}))
 
@@ -209,7 +211,7 @@ class ClientTests(unittest.TestCase):
                     prompt_submit=[submitted("adm-hard")])
         result = self.deliver("interrupt")
         self.assertEqual(result, {"ok": True, "applied": "interrupt", "applied_detail": "hard-interrupt",
-                                  "admission_id": "adm-hard"})
+                                  "admission_id": "adm-hard", "instance_id": INSTANCE})
         self.assertEqual(self.owner.calls[1:], [
             ("session.redirect", {"session_id": "s1", "text": "📡 hello", "execution_generation": 4}),
             ("session.interrupt", {"session_id": "s1", "execution_generation": 4}),
@@ -225,7 +227,7 @@ class ClientTests(unittest.TestCase):
                                        **{verb: [GatewayRPCError("stale_generation")]})
                 result = self.deliver(delivery)
                 self.assertEqual(result, {"ok": True, "applied": "start", "applied_detail": None,
-                                          "admission_id": "adm-stale"})
+                                          "admission_id": "adm-stale", "instance_id": INSTANCE})
                 self.assertEqual(self.owner.methods(),
                                  ["session.resume", verb.replace("_", "."), "session.resume", "prompt.submit"])
                 self.assertEqual(self.owner.calls[2][1], {"session_id": "s1", "omit_messages": True})
@@ -292,6 +294,16 @@ class ClientTests(unittest.TestCase):
                 result = self.deliver()
                 self.assertEqual((result["error"], result["exit"]), ("owner-restarting", 5))
                 self.assertEqual(self.owner.endpoints, [])
+
+    def test_owner_instance_is_the_discovered_endpoints_and_never_connects(self):
+        self.assertEqual(self.client.owner_instance(), INSTANCE)
+        for discovery in (SimpleNamespace(state="absent", endpoint=None),
+                          SimpleNamespace(state="starting", endpoint=None),
+                          OSError(f"ws://127.0.0.1:9/{LEAK}")):
+            with self.subTest(discovery=type(discovery).__name__):
+                self.discovery = discovery
+                self.assertIsNone(self.client.owner_instance())
+        self.assertEqual(self.owner.endpoints, [])
 
     def test_discovery_failure_is_not_reachable(self):
         self.discovery = OSError(f"ws://127.0.0.1:9/{LEAK}")

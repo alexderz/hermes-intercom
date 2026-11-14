@@ -16,17 +16,25 @@ A passive note is a ``messages`` row with ``requested='passive'`` and result
 ``note_key`` is its key, ``offered_turn`` the turn that was offered it. A note to
 ``all`` is one row with ``address='all'`` and no target. ``note_seen`` keeps, per
 lineage root and key, which ``all`` version a session was offered and when that
-was confirmed. ``sender_profile`` is NULL for the sender's own profile. Older
-files get these columns from the guarded migration in ``connect()``.
+was confirmed. ``sender_profile`` is NULL for the sender's own profile.
+
+A keyed queued message is a ``pending`` row with ``requested='queue'`` and a
+wake marker: ``wake_admission``, the submission id of the wake line its send (or
+the send it inherited from) put in Hermes's queue, and ``wake_instance``, the
+owner instance that took it. A wake is outstanding while its instance is the
+current owner's and no turn has been offered the row; a marker of another
+instance is dead. Older files get these columns from the guarded migration in
+``connect()``.
 
 Two writers share the file. The sender ``insert``s its row with an empty result,
 then ``update``s ``header_sha`` and the delivery result; a passive sender calls
 ``insert_note``, which marks the held note it replaces and inserts its own row in
-one transaction. The owner's reply hook ``update``s the reply fields and
-``insert``s the new reply row. ``claim_echo`` sets ``echoed_at`` once. At turn
-start the passive hook ``offer_notes`` (``offered_turn``, or a ``note_seen`` row
-for an ``all`` note) and at the turn's first model request ``confirm_notes``
-(``delivered_at``). Lookups are ``get`` (id), ``by_span_hash``,
+one transaction; a keyed queued sender calls ``insert_keyed_queue`` the same way
+(inheriting an outstanding wake), then ``wake_submitted`` or ``wake_failed``. The
+owner's reply hook ``update``s the reply fields and ``insert``s the new reply row.
+``claim_echo`` sets ``echoed_at`` once. At turn start the passive hook
+``offer_notes`` (``offered_turn``, or a ``note_seen`` row for an ``all`` note) and
+at the turn's first model request ``confirm_notes`` (``delivered_at``). Lookups are ``get`` (id), ``by_span_hash``,
 ``by_target_lineage`` and ``confirmed_in_turn``. Nothing is pruned, retried or
 walked through a status ladder.
 """
@@ -60,6 +68,8 @@ _UPDATE_FIELDS = frozenset({
     "reply", "reply_state", "replied_at", "reply_message_id",
     "offered_turn",
 })
+
+QUEUE = "queue"
 
 PASSIVE = "passive"
 ALL = "all"
@@ -97,7 +107,9 @@ CREATE TABLE IF NOT EXISTS messages (
   echoed_at REAL,
   note_key TEXT,
   offered_turn TEXT,
-  sender_profile TEXT
+  sender_profile TEXT,
+  wake_admission TEXT,
+  wake_instance TEXT
 )
 """
 
@@ -106,6 +118,8 @@ _ADDED_COLUMNS = (
     ("note_key", "TEXT"),
     ("offered_turn", "TEXT"),
     ("sender_profile", "TEXT"),
+    ("wake_admission", "TEXT"),
+    ("wake_instance", "TEXT"),
 )
 
 # Its own statement: conn.execute runs one statement only.
@@ -208,37 +222,63 @@ def insert_note(
     pending ``all`` row. Then the new row is inserted. Returns the replaced ids.
     """
     values = _row_values({"message_id": message_id, **row})
-    key = row.get("note_key")
-    mode = row.get("requested")
-    to_all = row.get("address") == ALL and not row.get("target_session_id")
-    ids = list(lineage)
 
     def write(conn: sqlite3.Connection) -> list[str]:
-        replaced: list[str] = []
-        if key:
-            if to_all:
-                where, args = "address = ? AND target_session_id IS NULL", [ALL]
-            elif ids:
-                marks = ", ".join("?" for _ in ids)
-                where, args = f"target_session_id IN ({marks})", ids
-            else:
-                where = None
-            if where is not None:
-                found = conn.execute(
-                    f"SELECT id FROM messages WHERE result = 'pending' AND note_key = ? "
-                    f"AND requested = ? AND {where}",
-                    (key, mode, *args),
-                ).fetchall()
-                replaced = [r["id"] for r in found]
-                for old in replaced:
-                    conn.execute(
-                        "UPDATE messages SET result = 'replaced', detail = ? WHERE id = ?",
-                        (f"replaced by {message_id}", old),
-                    )
+        replaced = [r["id"] for r in _held_with_key(conn, row, lineage)]
+        _replace(conn, replaced, message_id)
         _insert_row(conn, values, "pending")
         return replaced
 
     return _run_write(write)
+
+
+def insert_keyed_queue(
+    message_id: str,
+    *,
+    lineage: Sequence[str],
+    wake_admission: str,
+    instance_id: str | None,
+    **row,
+) -> tuple[list[str], bool]:
+    """Insert a keyed queued message (result ``pending``). Returns ``(replaced ids, submit)``.
+
+    One ``BEGIN IMMEDIATE``, as ``insert_note`` (same key, ``requested='queue'``, target in
+    *lineage*). When a replaced row's wake is outstanding (its ``wake_instance`` is
+    *instance_id*, the owner the send discovered, and no turn has been offered it), the new row
+    inherits that marker and *submit* is False. Otherwise the new row's marker is
+    (*wake_admission*, *instance_id*) and *submit* is True: the caller submits the wake after
+    commit.
+    """
+    values = list(_row_values({"message_id": message_id, **row}))
+    marker = _INSERT_COLUMNS.index("wake_admission")
+
+    def write(conn: sqlite3.Connection) -> tuple[list[str], bool]:
+        held = _held_with_key(conn, {**row, "requested": QUEUE}, lineage)
+        live = [r for r in held if _wake_outstanding(r, instance_id)]
+        if live:
+            values[marker:marker + 2] = [live[-1]["wake_admission"], live[-1]["wake_instance"]]
+        else:
+            values[marker:marker + 2] = [wake_admission, instance_id]
+        replaced = [r["id"] for r in held]
+        _replace(conn, replaced, message_id)
+        _insert_row(conn, tuple(values), "pending")
+        return replaced, not live
+
+    return _run_write(write)
+
+
+def wake_submitted(wake_admission: str, instance_id) -> None:
+    """The owner took the wake: its marker names the instance that answered."""
+    if not isinstance(instance_id, str) or not instance_id:
+        return
+    _run_write(lambda conn: conn.execute(
+        "UPDATE messages SET wake_instance = ? WHERE wake_admission = ?", (instance_id, wake_admission)))
+
+
+def wake_failed(wake_admission: str) -> None:
+    """The wake was not taken: its marker is dead, so its pending row rides the next turn."""
+    _run_write(lambda conn: conn.execute(
+        "UPDATE messages SET wake_instance = NULL WHERE wake_admission = ?", (wake_admission,)))
 
 
 def update(message_id: str, **fields) -> bool:
@@ -343,11 +383,15 @@ def by_target_lineage(session_ids: Sequence[str]) -> list[dict]:
 
 
 def offer_notes(turn_id: str, *, lineage: Sequence[str], root_id: str,
-                include_all: bool) -> list[dict]:
+                include_all: bool, wake_keys: Sequence[str] = (),
+                instance_id: str | None = None) -> list[dict]:
     """Offer this turn the held notes of one target lineage, oldest first.
 
     One ``BEGIN IMMEDIATE``. Per-target notes: the ``pending`` passive rows whose
-    target is in *lineage*; each gets ``offered_turn = turn_id``. With
+    target is in *lineage*, and the ``pending`` keyed queued rows whose key is in
+    *wake_keys* (this turn carries their wake) or whose wake is not outstanding for
+    *instance_id* (a turn was already offered them, or the marker is dead); each
+    gets ``offered_turn = turn_id``. With
     *include_all*: per key, the newest ``pending`` ``all`` row, unless its sender
     is in *lineage* or ``note_seen(root_id, key)`` already holds that row
     confirmed; each upserts ``note_seen(root_id, key) = (id, turn_id, NULL)``.
@@ -364,6 +408,13 @@ def offer_notes(turn_id: str, *, lineage: Sequence[str], root_id: str,
                 f"AND delivered_at IS NULL AND target_session_id IN ({marks})",
                 (PASSIVE, *ids),
             )]
+            keys = set(wake_keys)
+            notes.extend(r for r in map(_as_dict, conn.execute(
+                f"SELECT * FROM messages WHERE requested = ? AND result = 'pending' "
+                f"AND delivered_at IS NULL AND wake_admission IS NOT NULL "
+                f"AND target_session_id IN ({marks})",
+                (QUEUE, *ids),
+            )) if r["note_key"] in keys or not _wake_outstanding(r, instance_id))
         for row in notes:
             conn.execute("UPDATE messages SET offered_turn = ? WHERE id = ?", (turn_id, row["id"]))
             row["offered_turn"] = turn_id
@@ -451,8 +502,39 @@ _INSERT_COLUMNS = (
     "id", "kind", "in_reply_to", "sender_session_id", "sender_label", "sender_source",
     "target_session_id", "target_title", "address", "body", "sender_chat_scope",
     "target_chat_scope", "reply_mode", "requested", "request_id", "created_at",
-    "note_key", "sender_profile",
+    "note_key", "sender_profile", "wake_admission", "wake_instance",
 )
+
+
+def _held_with_key(conn: sqlite3.Connection, row: dict, lineage: Sequence[str]) -> list[dict]:
+    """The ``pending`` rows a keyed *row* replaces: same ``note_key`` and ``requested`` mode, and
+    for a per-target row a target in *lineage*, for an ``all`` row the pending ``all`` row."""
+    key, ids = row.get("note_key"), list(lineage)
+    if not key:
+        return []
+    if row.get("address") == ALL and not row.get("target_session_id"):
+        where, args = "address = ? AND target_session_id IS NULL", [ALL]
+    elif ids:
+        where, args = f"target_session_id IN ({', '.join('?' for _ in ids)})", ids
+    else:
+        return []
+    return [_as_dict(r) for r in conn.execute(
+        f"SELECT * FROM messages WHERE result = 'pending' AND note_key = ? AND requested = ? "
+        f"AND {where} ORDER BY created_at, id",
+        (key, row.get("requested"), *args),
+    )]
+
+
+def _replace(conn: sqlite3.Connection, ids: Sequence[str], message_id: str) -> None:
+    for old in ids:
+        conn.execute("UPDATE messages SET result = 'replaced', detail = ? WHERE id = ?",
+                     (f"replaced by {message_id}", old))
+
+
+def _wake_outstanding(row: dict, instance_id) -> bool:
+    """The row's wake is still in the current owner's queue: its instance, and no turn offered."""
+    return (isinstance(instance_id, str) and instance_id != ""
+            and row.get("wake_instance") == instance_id and row.get("offered_turn") is None)
 
 
 def _row_values(fields: dict) -> tuple:

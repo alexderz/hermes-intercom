@@ -280,6 +280,11 @@ def _applied_phrase(receipt: dict) -> str:
         key = receipt.get("key")
         keyed = f", key {key}" if key else ""
         return f"held (until its next turn; it does not wake it{keyed})"
+    if requested == "queue" and receipt.get("key"):
+        if receipt.get("receipt") == "queued":
+            return f"queued (replaceable, key {receipt['key']})"
+        if receipt.get("receipt") == "held":
+            return f"held (the gateway did not take its wake; rides its next turn, key {receipt['key']})"
     if applied == "steer":
         return "steered (into its running turn)"
     if applied == "queue" and requested and requested != "queue":
@@ -423,8 +428,15 @@ def _is_all(row: dict) -> bool:
     return row.get("address") == route.ALL and not row.get("target_session_id")
 
 
+def _keyed_queue(row: dict) -> bool:
+    """A keyed queued message stored ``pending`` (later ``delivered`` or ``replaced``)."""
+    return row.get("requested") == "queue" and bool(row.get("wake_admission"))
+
+
 def _note_words(row: dict) -> str:
     """A passive note: ``held``, ``delivered <time> (turn <id>)`` or ``replaced by <id>``.
+
+    A keyed queued message that is still pending is ``queued (replaceable)``.
 
     An ``all`` note is ``held for all · handed to N sessions``, N being the
     confirmed ``note_seen`` rows, then ``· replaced by <id>`` when replaced.
@@ -441,7 +453,7 @@ def _note_words(row: dict) -> str:
         return detail
     if result == "delivered":
         return f"delivered {_stamp(row.get('delivered_at'))} (turn {row.get('offered_turn') or 'unknown'})"
-    return "held"
+    return "queued (replaceable)" if _keyed_queue(row) else "held"
 
 
 def _handed_count(message_id) -> int:
@@ -480,7 +492,7 @@ def _delivery_words(row: dict) -> str:
         return f"refused ({detail})" if detail else "refused"
     if result == "error":
         return f"error ({detail})" if detail else "error"
-    if row.get("requested") == route.PASSIVE:
+    if row.get("requested") == route.PASSIVE or _keyed_queue(row):
         return _note_words(row)
     applied = row.get("applied")
     word = _APPLIED_WORD.get(applied, applied or "unknown")
@@ -697,6 +709,8 @@ def _log_delivery(row: dict) -> str:
     keyed = f" · key {key}" if key else ""
     if row.get("requested") == route.PASSIVE:
         return f"passive: {_note_words(row)}{keyed}"
+    if _keyed_queue(row):
+        return f"queue: {_note_words(row)}{keyed}"
     applied = row.get("applied")
     word = _APPLIED_WORD.get(applied, applied or (result or "unknown"))
     requested = row.get("requested")
