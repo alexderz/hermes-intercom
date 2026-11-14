@@ -51,6 +51,9 @@ _PASSIVE_NO_SEAM = dict(
              "legacy inbox, which cannot hold a note. Nothing was sent."),
 )
 
+# The ``profile`` parameter text, also one line of the tool text.
+_PROFILE_SENTENCE = 'profile: another Hermes profile on this machine; reach its bot with to: "Bot Chat"'
+
 # One line in the tool text for passive delivery and keys.
 _PASSIVE_SENTENCE = (
     "passive: held until the target's next turn, never wakes it; "
@@ -116,6 +119,7 @@ def _tool_description(projects: bool, user_name: str = "the user") -> str:
         + INTERRUPT_SENTENCE
         + " An idle session starts a turn.",
         _PASSIVE_SENTENCE,
+        _PROFILE_SENTENCE + ".",
         'Write only something new: no thanks, "got it", "agreed", restating, or "I\'ll look later". '
         "When you receive a message and have nothing new, answer [SILENT] (for an ask, reply with "
         "[SILENT]); nothing is sent. Do not poll for answers.",
@@ -166,6 +170,10 @@ def _schema(projects: bool, user_name: str = "the user") -> dict:
                     "description": (
                         "For passive or queue. A newer message with the same key replaces a held one."
                     ),
+                },
+                "profile": {
+                    "type": "string",
+                    "description": _PROFILE_SENTENCE + ". For send and list.",
                 },
                 "reply": {
                     "type": "string",
@@ -228,14 +236,14 @@ def _owner_dispatch(args: dict, **kw) -> dict:
     session_id = kw.get("session_id")
     ctx = _runtime["ctx"]
     if action == "list":
-        from . import address
+        from . import address, profiles
 
-        return address.list_sessions(
-            include_runs=bool(args.get("include_runs")),
-            query=args.get("query"),
-            limit=args["limit"] if "limit" in args else None,
-            sender=session_id,
-        )
+        listing = dict(include_runs=bool(args.get("include_runs")), query=args.get("query"),
+                       limit=args["limit"] if "limit" in args else None)
+        profile = profiles.other(args.get("profile"))
+        if profile is None:
+            return address.list_sessions(sender=session_id, **listing)
+        return _list_in_profile(profile, listing)
     if action == "send":
         from . import route
 
@@ -249,6 +257,7 @@ def _owner_dispatch(args: dict, **kw) -> dict:
                 delivery=args.get("delivery") or "steer",
                 reply_mode=args["reply"] if "reply" in args else None,
                 key=args.get("key"),
+                profile=args.get("profile"),
             )
         except ValueError as exc:
             return {"ok": False, "error": "usage", "exit": 2, "message": str(exc)}
@@ -261,6 +270,24 @@ def _owner_dispatch(args: dict, **kw) -> dict:
 
         return replies.reply(args, session_id=session_id)
     return {"ok": False, "error": f"unknown action {action!r}"}
+
+
+def _list_in_profile(profile: str, listing: dict) -> dict:
+    """``list`` for another profile: its sessions, read with its discovery and ``state.db``."""
+    from . import address, profiles, route
+    from .frame import sanitize_title
+
+    if profiles.home_for(profile) is None:
+        return {"ok": False, "error": "unknown-profile",
+                "message": route.UNKNOWN_PROFILE.format(name=sanitize_title(profile))}
+    with profiles.in_profile(profile):
+        if not profiles.enabled():
+            return {"ok": False, "error": "profile-not-enabled",
+                    "message": route.PROFILE_NOT_ENABLED.format(name=profile)}
+        result = address.list_sessions(**listing)
+    if isinstance(result, dict):
+        result["profile"] = profile
+    return result
 
 
 def _legacy_allowed() -> bool:

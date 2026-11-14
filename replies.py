@@ -21,7 +21,8 @@
      ``no-block``. A keyed queued message in its wake's turn takes the ``requested`` branch;
 5. silence: an empty or ``[SILENT]`` text (whole, first line or last line) is ``silent``;
 6. store, then deliver on a fresh thread through ``route.send(..., delivery="steer",
-   reply_mode="optional", reply_to=id)``. ``cron``, ``subagent``, ``oneshot`` and script
+   reply_mode="optional", reply_to=id)``, into the row's ``sender_profile`` when it came from
+   another profile. ``cron``, ``subagent``, ``oneshot`` and script
    senders are stored only: their run is over and nothing can wake it. Nothing retries;
 7. stopped and failed turns fire no hook, so nothing is sent for them.
 
@@ -233,7 +234,8 @@ def _answer(row: dict, answer: str, session_id: str, *, held: bool | None = None
 def _deliver(row: dict, text: str, session_id: str) -> None:
     try:
         receipt = route.send(session_id, row["sender_session_id"], text, ctx=_ctx["ctx"],
-                             delivery="steer", reply_mode="optional", reply_to=row["id"])
+                             delivery="steer", reply_mode="optional", reply_to=row["id"],
+                             profile=row.get("sender_profile"))
     except Exception as exc:  # health: allow BLE001 -- log the type only; the reply text can be in the traceback
         logger.warning("intercom: reply to message %s failed (%s)", row["id"], type(exc).__name__)
         return
@@ -268,7 +270,8 @@ def ask(args: dict, *, session_id=None, ctx=None, lister=None, **_kw) -> dict:
 
     receipt = route.send(session_id, args.get("to"), args.get("message"), ctx=ctx,
                          delivery=args.get("delivery") or "steer", reply_mode="waiting",
-                         kind="ask", lister=lister, on_inserted=on_inserted, key=args.get("key"))
+                         kind="ask", lister=lister, on_inserted=on_inserted, key=args.get("key"),
+                         profile=args.get("profile"))
     message_id = receipt.get("message_id")
     if receipt.get("ok") is not True:
         _drop(message_id)

@@ -28,6 +28,14 @@
 - 6 ``client.deliver_sync``;
 - 7 ``record.update`` and the receipt.
 
+Another profile (``profile``, passive.md P6): the usage check also refuses ``profile`` with
+``to: all``, ``ask`` or ``@<project>``; an unknown or deleted profile, and one where intercom is
+not enabled, are refused unrecorded. The sender's facts (its ``_Who`` and chat scope) are read
+first, in its own profile; then steps 1-7 run inside ``profiles.in_profile(profile)``, so the
+row lands in the target's record (``sender_profile`` set) and the target's config governs
+consent, chat scope and the user name. The sender label reads ``<profile>/<title>`` and the
+receipt names the target ``<profile>/<title>``. The sender's own profile is no ``profile``.
+
 Refusals of steps 0-3 are recorded as ``delivery_path='refused'`` rows; ``reply-missing`` and the
 usage refusals are not.
 
@@ -47,11 +55,12 @@ import time
 logger = logging.getLogger(__name__)
 
 try:
-    from . import address, client, frame, record, scope
+    from . import address, client, frame, profiles, record, scope
 except ImportError:  # loaded as top-level modules (the unittest layout)
     import address
     import client
     import frame
+    import profiles
     import record
     import scope
 
@@ -90,6 +99,18 @@ ALL_NEEDS_PASSIVE_KEY = ("Nothing was sent: to: all needs delivery: passive and 
                          "session mail does not send.")
 ALL_NEEDS_REPLY_NONE = ("Nothing was sent: to: all needs reply: none. One note would ask every "
                         "session to answer you.")
+PROFILE_WITH_ALL = ("Nothing was sent: to: all cannot take a profile. all reaches the sessions of "
+                    "your own profile only.")
+PROFILE_WITH_ASK = ("Nothing was sent: ask cannot take a profile. The asker waits in its own "
+                    "process, and an answer from another profile would never find it. Use send "
+                    "with reply: waiting.")
+PROFILE_WITH_PROJECT = ("Nothing was sent: @<project> cannot take a profile. Address a session in "
+                        "another profile by id, exact title or Home.")
+UNKNOWN_PROFILE = "Nothing was sent: there is no Hermes profile named {name} on this machine."
+PROFILE_NOT_ENABLED = ("Nothing was sent: session mail is not enabled in profile {name}, so its "
+                       "replies, echo and framing protection would not happen there.")
+INJECTION_OFF_IN = ("Not delivered: intercom may not deliver messages in Hermes profile {name} "
+                    "(allow_gateway_injection is off). Nothing was sent.")
 PASSIVE_WAITING = ("Nothing was sent: passive cannot use reply: waiting. waiting asks the target "
                    "to answer first, but a held note is dealt with after what its turn is for. "
                    "Use reply: requested, or steer.")
@@ -105,7 +126,8 @@ def cold_start_sentence(title: str, message_id: str) -> str:
 
 
 def send(sender, to, message, *, ctx, delivery="steer", reply_mode=None, kind="send",
-         reply_to=None, script=False, lister=None, on_inserted=None, key=None) -> dict:
+         reply_to=None, script=False, lister=None, on_inserted=None, key=None,
+         profile=None) -> dict:
     """Send *message* from *sender* to the one session *to* resolves to. Returns the receipt.
 
     *sender* is the calling session's id, or with ``script=True`` a script label (the CLI, which
@@ -114,6 +136,7 @@ def send(sender, to, message, *, ctx, delivery="steer", reply_mode=None, kind="s
     tells a cold start from an idle one. *on_inserted* is called with the message id and the
     target session once the row exists, before delivery (the ``ask`` waiter). *key* (with
     ``passive`` or ``queue``) lets a newer message with the same key replace a held one.
+    *profile* names another Hermes profile on this machine to deliver into.
     """
     passive = delivery == PASSIVE
     if not passive and delivery not in client.DELIVERIES:
@@ -125,11 +148,15 @@ def send(sender, to, message, *, ctx, delivery="steer", reply_mode=None, kind="s
     receipt = _Receipt(to=to, requested=delivery, reply=reply_mode)
     if not (reply_mode in REPLY_MODES or (reply_mode == "optional" and reply_to)):
         return receipt.refused("reply-missing", REPLY_MISSING, reply=None)
-    usage = _usage_error(delivery, key, to_all, reply_mode, kind)
+    profile = profiles.other(profile)
+    usage = _usage_error(delivery, key, to_all, reply_mode, kind, profile=profile, to=to)
     if usage:
         refused = receipt.refused("usage", usage)
         refused["exit"] = 2
         return refused
+    if profile is not None and profiles.home_for(profile) is None:
+        return receipt.refused("unknown-profile",
+                               UNKNOWN_PROFILE.format(name=frame.sanitize_title(profile)))
 
     message_id = secrets.token_hex(4)
     receipt.message_id = message_id
@@ -139,6 +166,41 @@ def send(sender, to, message, *, ctx, delivery="steer", reply_mode=None, kind="s
                sender_session_id=who.session_id, address=to if isinstance(to, str) else "",
                body=body, reply_mode=reply_mode, requested=delivery, in_reply_to=reply_to,
                note_key=key)
+    steps = dict(sender=sender, to=to, ctx=ctx, delivery=delivery, reply_mode=reply_mode,
+                 kind=kind, reply_to=reply_to, script=script, lister=lister,
+                 on_inserted=on_inserted)
+    if profile is None:
+        return _steps(receipt, row, who, **steps)
+
+    # Another profile: the sender's facts first, in its own profile; then the whole target side.
+    sender_scope = None if script else scope.chat_scope(sender, ctx)
+    own = profiles.current() or profiles.DEFAULT
+    who = who.in_profile(own)
+    row.update(sender_label=who.label, sender_profile=own)
+    with profiles.in_profile(profile):
+        if not profiles.enabled():
+            receipt.message_id = None
+            return receipt.refused("profile-not-enabled",
+                                   PROFILE_NOT_ENABLED.format(name=profile))
+        steps["ctx"] = profiles.Settings()
+        return _steps(receipt, row, who, profile=profile, sender_scope=sender_scope, **steps)
+
+
+_UNREAD = object()
+
+
+def _steps(receipt, row, who, *, sender, to, ctx, delivery, reply_mode, kind, reply_to, script,
+           lister, on_inserted, profile=None, sender_scope=_UNREAD) -> dict:
+    """Steps 0-7 for one message, in the active profile (the target's, under ``in_profile``).
+
+    *profile* is the target profile when it is not the sender's; *sender_scope* is then
+    already read, in the sender's profile.
+    """
+    passive = delivery == PASSIVE
+    key = row["note_key"]
+    to_all = row["address"].strip() == ALL
+    message_id, body = row["message_id"], row["body"]
+    injection_off = INJECTION_OFF if profile is None else INJECTION_OFF_IN.format(name=profile)
 
     # 0. empty
     if not body.strip():
@@ -149,7 +211,7 @@ def send(sender, to, message, *, ctx, delivery="steer", reply_mode=None, kind="s
         row.update(address=ALL)
         receipt.target_title = ALL
         if not injection_allowed():
-            return _refuse(receipt, row, "injection-off", INJECTION_OFF, result="error")
+            return _refuse(receipt, row, "injection-off", injection_off, result="error")
         return _hold(receipt, row, who, lineage=())
     resolved = address.resolve(to, lister=lister)
     if resolved.get("ok") is not True:
@@ -162,26 +224,29 @@ def send(sender, to, message, *, ctx, delivery="steer", reply_mode=None, kind="s
         return _refuse(receipt, row, detail, text, candidates=candidates)
     target = resolved["session_id"]
     title = frame.sanitize_title(resolved.get("title") or target)
-    receipt.target_session, receipt.target_title = target, title
+    # The receipt names a session of another profile as <profile>/<title>.
+    shown = title if profile is None else f"{profile}/{title}"
+    receipt.target_session, receipt.target_title = target, shown
     row.update(target_session_id=target, target_title=title)
-    if not script and target in _lineage_tips(sender):
+    if not script and profile is None and target in _lineage_tips(sender):
         return _refuse(receipt, row, "own-session", f"{NOTHING_SENT} {OWN_SESSION_REASON}")
 
     # 2. scopes
     target_scope = scope.chat_scope(target, ctx)
-    sender_scope = None if script else scope.chat_scope(sender, ctx)
+    if sender_scope is _UNREAD:
+        sender_scope = None if script else scope.chat_scope(sender, ctx)
     receipt.shared_chat = target_scope == scope.SHARED
     row.update(target_chat_scope=target_scope, sender_chat_scope=sender_scope)
 
     # 3. consent, for every delivery and every target kind
     if not injection_allowed():
-        return _refuse(receipt, row, "injection-off", INJECTION_OFF, result="error")
+        return _refuse(receipt, row, "injection-off", injection_off, result="error")
 
     # 4. the row before delivery; a passive note is held here
     if passive:
         return _hold(receipt, row, who, lineage=_target_lineage(target))
     if delivery == "queue" and key:
-        return _queue_keyed(receipt, row, who, ctx=ctx, lister=lister,
+        return _queue_keyed(receipt, row, who, ctx=ctx, lister=lister, shown=shown,
                             scopes=(sender_scope, target, target_scope, title))
     record.insert(**row)
     if on_inserted is not None:
@@ -205,14 +270,14 @@ def send(sender, to, message, *, ctx, delivery="steer", reply_mode=None, kind="s
                       applied=applied, applied_detail=applied_detail, result=result,
                       delivered_at=time.time())
         receipt.applied, receipt.applied_detail = applied, applied_detail
-        sentence = _delivered_sentence(applied, applied_detail, title, message_id, was_open)
+        sentence = _delivered_sentence(applied, applied_detail, shown, message_id, was_open)
         return receipt.done(result, " ".join(
             part for part in (sentence, _weaker(delivery, applied),
                               _answer_sentence(reply_mode, who, message_id),
                               _shared_sentence(receipt.shared_chat)) if part))
     detail = outcome.get("error") or "delivery-unknown"
     record.update(message_id, delivery_path="owner", result="error", detail=detail)
-    return receipt.error(detail, _error_sentence(detail, outcome.get("code"), title, message_id))
+    return receipt.error(detail, _error_sentence(detail, outcome.get("code"), shown, message_id))
 
 
 def frame_stored(row: dict, ctx) -> str:
@@ -222,6 +287,8 @@ def frame_stored(row: dict, ctx) -> str:
     """
     if row.get("sender_source") == SCRIPT_SOURCE or not row.get("sender_session_id"):
         who = _Who.script(row.get("sender_label"))
+    elif row.get("sender_profile"):
+        who = _Who.of_profile(row["sender_session_id"], row["sender_profile"], row)
     else:
         who = _Who.session(row["sender_session_id"])
     sender_scope = None if who.kind == "script" else row.get("sender_chat_scope")
@@ -254,9 +321,16 @@ def header_sha(text: str, message_id: str) -> str:
 # ── internals ────────────────────────────────────────────────────────────────
 
 
-def _usage_error(delivery, key, to_all, reply_mode, kind) -> str | None:
+def _usage_error(delivery, key, to_all, reply_mode, kind, *, profile=None, to=None) -> str | None:
     """The reason a combination cannot work, or None. Checked before a message id exists."""
     passive = delivery == PASSIVE
+    if profile is not None:
+        if to_all:
+            return PROFILE_WITH_ALL
+        if kind == "ask":
+            return PROFILE_WITH_ASK
+        if isinstance(to, str) and to.strip().startswith("@"):
+            return PROFILE_WITH_PROJECT
     if kind == "ask" and key:
         return KEY_WITH_ASK
     if kind == "ask" and passive:
@@ -290,10 +364,11 @@ def _framed(message_id, who, body, *, ctx, reply_mode, scopes, interrupt=False, 
     return sanitize_user_prompt_text(text)
 
 
-def _queue_keyed(receipt, row, who, *, ctx, lister, scopes) -> dict:
+def _queue_keyed(receipt, row, who, *, ctx, lister, scopes, shown) -> dict:
     """A keyed queued message: stored ``pending``; it rides an outstanding wake or queues one."""
     message_id = row.pop("message_id")
-    _sender_scope, target, _target_scope, title = scopes
+    target = scopes[1]
+    title = shown
     key = row["note_key"]
     wake = client.submission_id(message_id)
     replaced, submit = record.insert_keyed_queue(
@@ -437,6 +512,24 @@ class _Who:
         title = facts["title"] or session_id
         return cls(kind=kind, label=title, source=source, session_id=session_id, title=title,
                    platform=facts["platform"], chat_type=facts["chat_type"])
+
+    def in_profile(self, profile):
+        """This sender as another profile sees it: ``<profile>/<title>``."""
+        label = frame.sanitize_title(f"{profile}/{self.title or self.label}")
+        return _Who(kind=self.kind, label=label, source=self.source, session_id=self.session_id,
+                    title=label, platform=self.platform, chat_type=self.chat_type)
+
+    @classmethod
+    def of_profile(cls, session_id, profile, row):
+        """A sender of *row* in another profile: its facts read there, else the row's label."""
+        try:
+            with profiles.in_profile(profile):
+                return cls.session(session_id).in_profile(profile)
+        except LookupError:  # that profile is gone: the stored label still names the sender
+            source = row.get("sender_source") or "unknown"
+            label = frame.sanitize_title(row.get("sender_label"))
+            return cls(kind="session" if source in scope.LOCAL_SOURCES else "messaging",
+                       label=label, source=source, session_id=session_id, title=label)
 
     def frame_sender(self):
         if self.kind == "script":
