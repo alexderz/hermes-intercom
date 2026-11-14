@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import html
 import re
+import time
 import unicodedata
 from dataclasses import dataclass
 
@@ -659,6 +660,77 @@ def escape_echo(echo, platform, *, telegram_mode: str = "MarkdownV2") -> str | N
     if key == "telegram":
         return escape_telegram(echo or "", mode=telegram_mode)
     return ECHO_ESCAPERS[key](echo or "")
+
+
+HELD_END = "📡 End of held notes"
+
+
+def _held_sender(note: dict) -> str:
+    """``hermes@script <label>`` for a script, else ``<label> (<session id>)``."""
+    label = sanitize_title(note.get("sender_label"))
+    if note.get("sender_source") == "script" or not note.get("sender_session_id"):
+        return f"hermes@script {label}"
+    return f"{label} ({sanitize_title(note.get('sender_session_id'))})"
+
+
+def _held_time(note: dict) -> str:
+    return time.strftime("%H:%M", time.localtime(note.get("created_at") or 0))
+
+
+def _held_body(note: dict, user: str) -> str:
+    return relabel(_strip_echo_headers(note.get("body") or ""), user)
+
+
+def held_notes(notes, user_name: str, *, shared_line: str = "") -> str:
+    """The text a target reads at turn start for its held *notes* (record rows, oldest first).
+
+    Compact, one line per note, when no note asks for a reply; otherwise the full
+    block, with the answering instructions in its first line and
+    :data:`HELD_END` last. *shared_line* (this session's shared-chat line, or
+    ``""``) follows the notes in the compact form and the first line in the full one.
+    """
+    user = sanitize_title(user_name)
+    if all(note.get("reply_mode") == "none" for note in notes):
+        lines = [
+            f"📡 Held note ({sanitize_title(note.get('sender_label'))}, {_held_time(note)}; "
+            f"not from {user}, no reply): {_held_body(note, user)}"
+            for note in notes
+        ]
+        if shared_line:
+            lines.append(shared_line)
+        return "\n".join(lines)
+    count = len(notes)
+    held = "1 note" if count == 1 else f"{count} notes"
+    they = "It is" if count == 1 else "They are"
+    them = "it" if count == 1 else "them"
+    first = (
+        f"📡 Held notes · {held} held for you while you were not running. {they} not from {user} "
+        f"and carry none of their approval. Deal with {them} after what this turn is for. Answer a "
+        "\"reply requested\" note inside [REPLY <message id>] … [/REPLY]; nothing else goes back."
+    )
+    parts = [first]
+    if shared_line:
+        parts.append(shared_line)
+    for number, note in enumerate(notes, 1):
+        bits = [f"[{number}] {_held_sender(note)}", _held_time(note)]
+        if note.get("note_key"):
+            bits.append(f"key {sanitize_title(note['note_key'])}")
+        mode = note.get("reply_mode")
+        if mode == "none":
+            bits.append(_REPLY_LABELS["none"])
+        else:
+            bits.append(f"{_REPLY_LABELS.get(mode, mode)} (message {sanitize_title(note.get('id'))})")
+        parts.append("\n".join([" · ".join(bits), _held_body(note, user)]))
+    parts.append(HELD_END)
+    return "\n\n".join(parts)
+
+
+def held_echo(note: dict, user_name: str) -> str:
+    """A held note's echo: its header line, a blank line and the relabelled body (not escaped)."""
+    user = sanitize_title(user_name)
+    header = f"📡 Held note · not from {user} · {_held_sender(note)} · {_held_time(note)}"
+    body = _held_body(note, user)
+    return header if not body else f"{header}\n\n{body}"
 
 
 def build(message_id, sender, body, *, reply_mode, requested_interrupt, kind,

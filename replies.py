@@ -6,14 +6,16 @@
    turn's prompt;
 2. the messages in them: a line starting ``📡 Not `` and ending ``message <8 hex>):``, spanning to
    ``📡 End of message <id>``, whose SHA-256 equals the row's ``header_sha`` (``find_messages``,
-   which the echo reuses);
+   which the echo reuses), plus the held notes confirmed as handed over in this turn
+   (``record.confirmed_in_turn(turn_id)``; ``passive.py``), which have no span;
 3. real candidates only: ``kind='send'``, ``reply_mode != 'none'``, ``reply_state IS NULL`` and
    a target in this session's compression lineage. A ``none`` note is never a candidate;
 4. the reply text by ``reply_mode``:
    - ``requested`` / ``waiting``: the ``[REPLY <id>]`` block, else the whole answer. A sender in
      a shared chat (or a ``NULL`` scope with a messaging source) gets the block only; with no
      block, ``stored`` / ``shared-chat-no-block``;
-   - ``optional`` (the message was a reply): the block only; with no block, ``no-block``;
+   - ``optional`` (the message was a reply) and every held note (``requested='passive'``):
+     the block only; with no block, ``no-block``;
 5. silence: an empty or ``[SILENT]`` text (whole, first line or last line) is ``silent``;
 6. store, then deliver on a fresh thread through ``route.send(..., delivery="steer",
    reply_mode="optional", reply_to=id)``. ``cron``, ``subagent``, ``oneshot`` and script
@@ -126,12 +128,16 @@ def turn_rows(user_message, conversation_history) -> list[str]:
 
 
 def on_post_llm_call(session_id=None, user_message=None, assistant_response=None,
-                     conversation_history=None, **_kw) -> None:
+                     conversation_history=None, turn_id=None, **_kw) -> None:
     """Send each real candidate's reply back. Returns before any reply is delivered."""
     if not isinstance(session_id, str) or not session_id:
         return
     try:
         messages = find_messages(turn_rows(user_message, conversation_history))
+        # Held notes confirmed as handed over in this turn (passive.py); they carry no span.
+        seen = {row["id"] for row, _span in messages}
+        messages.extend((row, None) for row in record.confirmed_in_turn(turn_id)
+                        if row["id"] not in seen)
         if not messages:
             return
         lineage = _lineage(session_id)
@@ -165,7 +171,8 @@ def reply_for(row: dict, answer: str) -> tuple[str, str | None, str | None]:
     """
     block = reply_block(answer, row["id"])
     if block is None:
-        if row["reply_mode"] == "optional":
+        # A held note rides a turn that exists for something else: block only.
+        if row["reply_mode"] == "optional" or row.get("requested") == record.PASSIVE:
             return "no-block", None, None
         if _shared_sender(row):
             return "stored", None, "shared-chat-no-block"

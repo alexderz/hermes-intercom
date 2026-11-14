@@ -23,9 +23,12 @@ Two writers share the file. The sender ``insert``s its row with an empty result,
 then ``update``s ``header_sha`` and the delivery result; a passive sender calls
 ``insert_note``, which marks the held note it replaces and inserts its own row in
 one transaction. The owner's reply hook ``update``s the reply fields and
-``insert``s the new reply row. ``claim_echo`` sets ``echoed_at`` once. Lookups are
-``get`` (id), ``by_span_hash`` and ``by_target_lineage``. Nothing is pruned,
-retried or walked through a status ladder.
+``insert``s the new reply row. ``claim_echo`` sets ``echoed_at`` once. At turn
+start the passive hook ``offer_notes`` (``offered_turn``, or a ``note_seen`` row
+for an ``all`` note) and at the turn's first model request ``confirm_notes``
+(``delivered_at``). Lookups are ``get`` (id), ``by_span_hash``,
+``by_target_lineage`` and ``confirmed_in_turn``. Nothing is pruned, retried or
+walked through a status ladder.
 """
 
 from __future__ import annotations
@@ -333,6 +336,109 @@ def by_target_lineage(session_ids: Sequence[str]) -> list[dict]:
             ORDER BY created_at, id
             """,
             ids,
+        ).fetchall()
+        return [_as_dict(row) for row in rows]
+
+    return _run_read(read)
+
+
+def offer_notes(turn_id: str, *, lineage: Sequence[str], root_id: str,
+                include_all: bool) -> list[dict]:
+    """Offer this turn the held notes of one target lineage, oldest first.
+
+    One ``BEGIN IMMEDIATE``. Per-target notes: the ``pending`` passive rows whose
+    target is in *lineage*; each gets ``offered_turn = turn_id``. With
+    *include_all*: per key, the newest ``pending`` ``all`` row, unless its sender
+    is in *lineage* or ``note_seen(root_id, key)`` already holds that row
+    confirmed; each upserts ``note_seen(root_id, key) = (id, turn_id, NULL)``.
+    An offer that is never confirmed is offered again by the next call.
+    """
+    ids = list(lineage)
+    marks = ", ".join("?" for _ in ids)
+
+    def write(conn: sqlite3.Connection) -> list[dict]:
+        notes = []
+        if ids:
+            notes = [_as_dict(r) for r in conn.execute(
+                f"SELECT * FROM messages WHERE requested = ? AND result = 'pending' "
+                f"AND delivered_at IS NULL AND target_session_id IN ({marks})",
+                (PASSIVE, *ids),
+            )]
+        for row in notes:
+            conn.execute("UPDATE messages SET offered_turn = ? WHERE id = ?", (turn_id, row["id"]))
+            row["offered_turn"] = turn_id
+        if include_all:
+            newest: dict[str, dict] = {}
+            for r in conn.execute(
+                "SELECT * FROM messages WHERE address = ? AND target_session_id IS NULL "
+                "AND requested = ? AND result = 'pending' AND note_key IS NOT NULL "
+                "ORDER BY created_at, id",
+                (ALL, PASSIVE),
+            ):
+                newest[r["note_key"]] = _as_dict(r)
+            for key, row in newest.items():
+                if row.get("sender_session_id") in ids:
+                    continue
+                seen = conn.execute(
+                    "SELECT message_id, delivered_at FROM note_seen WHERE root_id = ? AND note_key = ?",
+                    (root_id, key),
+                ).fetchone()
+                if seen is not None and seen["message_id"] == row["id"] and seen["delivered_at"] is not None:
+                    continue
+                conn.execute(
+                    "INSERT INTO note_seen (root_id, note_key, message_id, turn_id, delivered_at) "
+                    "VALUES (?, ?, ?, ?, NULL) ON CONFLICT (root_id, note_key) DO UPDATE SET "
+                    "message_id = excluded.message_id, turn_id = excluded.turn_id, delivered_at = NULL",
+                    (root_id, key, row["id"], turn_id),
+                )
+                notes.append(row)
+        notes.sort(key=lambda r: (r["created_at"], r["id"]))
+        return notes
+
+    return _run_write(write)
+
+
+def confirm_notes(turn_id: str, *, root_id: str, delivered_at: float | None = None) -> list[dict]:
+    """Mark the notes offered in *turn_id* handed over. Returns the per-target rows confirmed now.
+
+    One ``BEGIN IMMEDIATE``: ``messages`` rows with ``offered_turn = turn_id`` and no
+    ``delivered_at`` get it, and result ``delivered`` unless already ``replaced``;
+    ``note_seen`` rows of *root_id* offered in *turn_id* get ``delivered_at``.
+    """
+    when = time.time() if delivered_at is None else delivered_at
+
+    def write(conn: sqlite3.Connection) -> list[dict]:
+        rows = [_as_dict(r) for r in conn.execute(
+            "SELECT * FROM messages WHERE offered_turn = ? AND delivered_at IS NULL "
+            "ORDER BY created_at, id",
+            (turn_id,),
+        )]
+        conn.execute(
+            "UPDATE messages SET delivered_at = ?, "
+            "result = CASE WHEN result = 'replaced' THEN result ELSE 'delivered' END "
+            "WHERE offered_turn = ? AND delivered_at IS NULL",
+            (when, turn_id),
+        )
+        conn.execute(
+            "UPDATE note_seen SET delivered_at = ? "
+            "WHERE root_id = ? AND turn_id = ? AND delivered_at IS NULL",
+            (when, root_id, turn_id),
+        )
+        return rows
+
+    return _run_write(write)
+
+
+def confirmed_in_turn(turn_id: str) -> list[dict]:
+    """Per-target notes confirmed as handed over in *turn_id*, oldest first."""
+    if not isinstance(turn_id, str) or turn_id == "":
+        return []
+
+    def read(conn: sqlite3.Connection) -> list[dict]:
+        rows = conn.execute(
+            "SELECT * FROM messages WHERE offered_turn = ? AND delivered_at IS NOT NULL "
+            "ORDER BY created_at, id",
+            (turn_id,),
         ).fetchall()
         return [_as_dict(row) for row in rows]
 

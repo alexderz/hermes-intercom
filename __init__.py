@@ -393,6 +393,10 @@ def register(ctx) -> None:
     from . import echo
 
     echo.register(ctx)
+    # The held-note hooks (pre_llm_call, pre_api_request): passive notes at turn start.
+    from . import passive
+
+    passive.register(ctx)
     from . import cli as cli_mod
 
     cli_mod.register(ctx)
