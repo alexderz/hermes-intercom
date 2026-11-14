@@ -27,6 +27,7 @@ COLUMNS = (
     "reply_mode", "requested", "applied", "applied_detail",
     "result", "detail", "reply", "reply_state",
     "created_at", "delivered_at", "replied_at", "echoed_at",
+    "note_key", "offered_turn", "sender_profile",
 )
 
 REPLY_CHECK = "CHECK (reply_mode IN ('none','requested','waiting','optional'))"
@@ -100,7 +101,7 @@ class SchemaTests(RecordTestBase):
         self.assertNotIn("expect_reply", sql)
         self.assertNotIn("retry_count", names)
         self.assertNotIn("status", names)
-        self.assertEqual(tables, ["messages"])
+        self.assertEqual(tables, ["messages", "note_seen"])
         self.assertIn(REPLY_CHECK, sql)
         for column in ("delivery_path", "admission_id", "header_sha", "echoed_at", "reply_state"):
             self.assertIn(column, names)

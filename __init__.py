@@ -44,6 +44,19 @@ _NO_SEAM = {
     "message": "Not delivered: this process has no classic CLI session, so the legacy inbox cannot run.",
 }
 
+# Passive notes are held in the record and handed over by the gateway's hooks.
+_PASSIVE_NO_SEAM = dict(
+    _NO_SEAM,
+    message=("Not delivered: passive needs the gateway, and this Hermes build only has the "
+             "legacy inbox, which cannot hold a note. Nothing was sent."),
+)
+
+# One line in the tool text for passive delivery and keys.
+_PASSIVE_SENTENCE = (
+    "passive: held until the target's next turn, never wakes it; "
+    "key: a newer message with the same key replaces a held one."
+)
+
 _runtime = {"ctx": None, "legacy": False, "inbox_up": False}
 
 
@@ -102,6 +115,7 @@ def _tool_description(projects: bool, user_name: str = "the user") -> str:
         "interrupt stops it and runs your message now. "
         + INTERRUPT_SENTENCE
         + " An idle session starts a turn.",
+        _PASSIVE_SENTENCE,
         'Write only something new: no thanks, "got it", "agreed", restating, or "I\'ll look later". '
         "When you receive a message and have nothing new, answer [SILENT] (for an ask, reply with "
         "[SILENT]); nothing is sent. Do not poll for answers.",
@@ -139,11 +153,18 @@ def _schema(projects: bool, user_name: str = "the user") -> dict:
                 },
                 "delivery": {
                     "type": "string",
-                    "enum": ["interrupt", "steer", "queue"],
+                    "enum": ["interrupt", "steer", "queue", "passive"],
                     "default": "steer",
                     "description": (
                         "steer (default) joins the other session's running turn; queue runs after it; "
                         "interrupt stops it and runs your message now. " + INTERRUPT_SENTENCE
+                        + " passive is held until the other session's next turn and never wakes it."
+                    ),
+                },
+                "key": {
+                    "type": "string",
+                    "description": (
+                        "For passive or queue. A newer message with the same key replaces a held one."
                     ),
                 },
                 "reply": {
@@ -227,6 +248,7 @@ def _owner_dispatch(args: dict, **kw) -> dict:
                 ctx=ctx,
                 delivery=args.get("delivery") or "steer",
                 reply_mode=args["reply"] if "reply" in args else None,
+                key=args.get("key"),
             )
         except ValueError as exc:
             return {"ok": False, "error": "usage", "exit": 2, "message": str(exc)}
@@ -331,6 +353,8 @@ def _handle(args: dict, **_kw) -> str:
 
 
 def _legacy_dispatch(args: dict, **_kw) -> dict:
+    if args.get("action") in ("send", "ask") and args.get("delivery") == "passive":
+        return dict(_PASSIVE_NO_SEAM)
     if not _ensure_legacy_inbox():
         return dict(_NO_SEAM)
     return _legacy_action(args)
