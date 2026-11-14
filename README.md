@@ -240,6 +240,8 @@ Refused, with the reason:
 - Intercom is not enabled in the target profile: error `profile-not-enabled`. Session mail is not enabled there, so its replies, echo and framing protection would not happen. Nothing is recorded.
 - The target's `allow_gateway_injection` is not exactly `true`: error `injection-off`. The refusal is recorded in the target profile. The sender's own consent is not the one that is checked.
 
+`unknown-profile` and `profile-not-enabled` come from the tool's `profile`; the CLI reaches another profile with `hermes -p` and never returns them.
+
 A `within` deadline on a note sent with `profile` is fired by the same sweep as any other deadline (see [Deadlines](#deadlines)).
 
 ## CLI
@@ -334,7 +336,13 @@ These are refused before anything is recorded (CLI exit 2), with the reason:
 
 Who fires it: the gateway itself, at the first kanban dispatcher tick after the deadline (`kanban.dispatch_interval_seconds`, 60 s by default; the first tick runs about 5 s after the gateway starts, so a deadline that passed while it was down fires then). No job is installed. Nothing fires while `hermes pause` is engaged; deadlines that came due meanwhile fire after resume. One sweep covers every profile on the machine whose config enables intercom, so deadlines on notes sent to another profile (`profile`) are fired by the same sweep.
 
-With `kanban.dispatch_in_gateway: false`, or with intercom disabled in the default profile, the gateway does not run the sweep. Deadlines then fire only when `hermes intercom wake-due` runs. It runs the same sweep once in the foreground, for every profile, and prints nothing. The operator may schedule that command (for example from cron). One run covers every profile, including notes sent with `profile`. Nothing in the plugin creates that schedule.
+With `kanban.dispatch_in_gateway: false`, or with intercom disabled in the default profile, the gateway does not run the sweep. Deadlines then fire only when `hermes intercom wake-due` runs in a profile where intercom is enabled. Plugin commands are registered only for plugins that profile has enabled, so the command has to run there: a bare `hermes intercom wake-due` in a default profile that has intercom disabled is an unknown subcommand and fires nothing. When the default profile has intercom enabled, the command is `hermes intercom wake-due`. Otherwise name a profile that has it enabled:
+
+```text
+* * * * * hermes -p <a profile with intercom enabled> intercom wake-due
+```
+
+It runs the same sweep once in the foreground, for every profile, and prints nothing. One such entry covers every profile, including notes sent with `profile`, so there is no need for one entry per profile. A cron environment needs `hermes` on `PATH` (or an absolute path) and the same `HERMES_HOME` as the gateway. Nothing in the plugin creates that schedule.
 
 ## Reboots
 
