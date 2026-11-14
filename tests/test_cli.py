@@ -287,7 +287,8 @@ class SchemaTests(CliTestBase):
         self.assertFalse(inspect.iscoroutinefunction(tool["handler"]))
         self.assertIs(tool["handler"], self.plugin.handle)
         self.assertEqual([hook[0] for hook in self.ctx.hooks],
-                         ["post_llm_call", "pre_llm_call", "pre_api_request"])
+                         ["post_llm_call", "pre_llm_call", "pre_api_request",
+                          "pre_llm_call", "pre_api_request"])
         self.assertNotIn(self.plugin._on_pre_llm_call, [hook[1] for hook in self.ctx.hooks])
 
     def test_tool_text_names_the_configured_user(self):
