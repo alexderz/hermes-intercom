@@ -4,19 +4,26 @@
 
 - inputs: a ``reply_mode`` outside ``none`` / ``requested`` / ``waiting`` is ``reply-missing``
   and records nothing. ``optional`` is only for a reply (``reply_to`` set, from the reply hook);
+- usage: ``passive`` is checked before the live-delivery enum, then the combinations of
+  ``key``, ``to: all``, ``reply`` and ``ask`` that cannot work are ``usage`` refusals: no
+  message id, nothing recorded (CLI exit 2);
 - 0 an empty or whitespace-only message is ``empty``;
-- 1 ``address.resolve(to)``: ``ambiguous`` / ``unknown`` with candidates, the project-addressing refusals,
+- 1 ``all`` is matched first, like ``Home`` (a session titled "all" is reachable only by id);
+  otherwise ``address.resolve(to)``: ``ambiguous`` / ``unknown`` with candidates, the project-addressing refusals,
   and ``own-session`` when the target is the sender's own session;
 - 2 the chat scopes of the target and of a session sender (``scope.chat_scope``);
 - 3 consent for **every** delivery: ``plugins.entries.intercom.allow_gateway_injection`` must
   be ``true``, read fresh from the profile config, else ``injection-off``;
-- 4 ``record.insert`` before delivery;
+- 4 ``record.insert`` before delivery. A passive note stops here: ``record.insert_note``
+  stores it ``pending`` (replacing the held note with its key and mode in the target's
+  lineage, or the pending ``all`` row) and the receipt is ``held``; nothing is delivered;
 - 5 ``frame.build``, ``sanitize_user_prompt_text`` once, then ``header_sha`` over the span from
   header line 1 to the closing line, stored in the row;
 - 6 ``client.deliver_sync``;
 - 7 ``record.update`` and the receipt.
 
-Refusals of steps 0-3 are recorded as ``delivery_path='refused'`` rows; ``reply-missing`` is not.
+Refusals of steps 0-3 are recorded as ``delivery_path='refused'`` rows; ``reply-missing`` and the
+usage refusals are not.
 
 Operator power, deliberately: a stored messaging chat is delivered whatever its
 platform's allowlist says now. Its scope is ``shared`` unless listed, so the frame carries the
@@ -43,6 +50,8 @@ except ImportError:  # loaded as top-level modules (the unittest layout)
     import scope
 
 REPLY_MODES = ("none", "requested", "waiting")
+PASSIVE = record.PASSIVE
+ALL = record.ALL
 DEFAULT_USER_NAME = "the user"
 SCRIPT_SOURCE = "script"
 
@@ -63,6 +72,22 @@ _ERROR_SENTENCES = {
 _VERBATIM_REFUSALS = frozenset({"project-addressing-unavailable", "no-owner-set"})
 _UNWAKEABLE = {"cron": "cron run", "oneshot": "oneshot", "subagent": "subagent"}
 
+# Usage refusals: each names the reason in plain words (passive.md, section 2).
+KEY_WITH_LIVE = ("Nothing was sent: key works only with passive or queue. {delivery} hands the "
+                 "message over at once, so there is no held message for a newer one to replace.")
+KEY_WITH_ASK = ("Nothing was sent: ask cannot take a key. The asker waits on that exact message, "
+                "so a replaced ask would leave it waiting until it times out.")
+ASK_PASSIVE = ("Nothing was sent: ask cannot be passive. An ask waits at most an hour and a "
+               "held note may wait days, so it would always time out. Use steer.")
+ALL_NEEDS_PASSIVE_KEY = ("Nothing was sent: to: all needs delivery: passive and a key. An unkeyed "
+                         "or waking message to every session is a general notification, which "
+                         "session mail does not send.")
+ALL_NEEDS_REPLY_NONE = ("Nothing was sent: to: all needs reply: none. One note would ask every "
+                        "session to answer you.")
+PASSIVE_WAITING = ("Nothing was sent: passive cannot use reply: waiting. waiting asks the target "
+                   "to answer first, but a held note is dealt with after what its turn is for. "
+                   "Use reply: requested, or steer.")
+
 
 def not_addressable_sentence(title: str) -> str:
     return f'"{title}" is open in the admin dashboard, which intercom cannot reach. Nothing was sent.'
@@ -74,21 +99,31 @@ def cold_start_sentence(title: str, message_id: str) -> str:
 
 
 def send(sender, to, message, *, ctx, delivery="steer", reply_mode=None, kind="send",
-         reply_to=None, script=False, lister=None, on_inserted=None) -> dict:
+         reply_to=None, script=False, lister=None, on_inserted=None, key=None) -> dict:
     """Send *message* from *sender* to the one session *to* resolves to. Returns the receipt.
 
     *sender* is the calling session's id, or with ``script=True`` a script label (the CLI, which
     always frames as a script and never names a session as sender). *ctx* reads the plugin's
     settings. *lister* is ``session.list`` (tests pass their own); it decorates candidates and
     tells a cold start from an idle one. *on_inserted* is called with the message id and the
-    target session once the row exists, before delivery (the ``ask`` waiter).
+    target session once the row exists, before delivery (the ``ask`` waiter). *key* (with
+    ``passive`` or ``queue``) lets a newer message with the same key replace a held one.
     """
-    if delivery not in client.DELIVERIES:
-        raise ValueError(f"delivery must be one of {', '.join(client.DELIVERIES)}")
+    passive = delivery == PASSIVE
+    if not passive and delivery not in client.DELIVERIES:
+        raise ValueError(f"delivery must be one of {', '.join((*client.DELIVERIES, PASSIVE))}")
     reply_to = reply_to or None
+    key = key.strip() if isinstance(key, str) else None
+    key = key or None
+    to_all = isinstance(to, str) and to.strip() == ALL
     receipt = _Receipt(to=to, requested=delivery, reply=reply_mode)
     if not (reply_mode in REPLY_MODES or (reply_mode == "optional" and reply_to)):
         return receipt.refused("reply-missing", REPLY_MISSING, reply=None)
+    usage = _usage_error(delivery, key, to_all, reply_mode, kind)
+    if usage:
+        refused = receipt.refused("usage", usage)
+        refused["exit"] = 2
+        return refused
 
     message_id = secrets.token_hex(4)
     receipt.message_id = message_id
@@ -96,13 +131,20 @@ def send(sender, to, message, *, ctx, delivery="steer", reply_mode=None, kind="s
     who = _Who.script(sender) if script else _Who.session(sender)
     row = dict(message_id=message_id, kind=kind, sender_label=who.label, sender_source=who.source,
                sender_session_id=who.session_id, address=to if isinstance(to, str) else "",
-               body=body, reply_mode=reply_mode, requested=delivery, in_reply_to=reply_to)
+               body=body, reply_mode=reply_mode, requested=delivery, in_reply_to=reply_to,
+               note_key=key)
 
     # 0. empty
     if not body.strip():
         return _refuse(receipt, row, "empty", f"{NOTHING_SENT} {EMPTY_REASON}")
 
-    # 1. resolve, then own-session
+    # 1. all (before addressing, like Home), resolve, then own-session
+    if to_all:
+        row.update(address=ALL)
+        receipt.target_title = ALL
+        if not injection_allowed():
+            return _refuse(receipt, row, "injection-off", INJECTION_OFF, result="error")
+        return _hold(receipt, row, who, lineage=())
     resolved = address.resolve(to, lister=lister)
     if resolved.get("ok") is not True:
         detail = resolved.get("error") or "unknown"
@@ -130,7 +172,9 @@ def send(sender, to, message, *, ctx, delivery="steer", reply_mode=None, kind="s
     if not injection_allowed():
         return _refuse(receipt, row, "injection-off", INJECTION_OFF, result="error")
 
-    # 4. the row before delivery
+    # 4. the row before delivery; a passive note is held here
+    if passive:
+        return _hold(receipt, row, who, lineage=_target_lineage(target))
     record.insert(**row)
     if on_inserted is not None:
         on_inserted(message_id, target)
@@ -193,6 +237,55 @@ def header_sha(text: str, message_id: str) -> str:
 
 
 # ── internals ────────────────────────────────────────────────────────────────
+
+
+def _usage_error(delivery, key, to_all, reply_mode, kind) -> str | None:
+    """The reason a combination cannot work, or None. Checked before a message id exists."""
+    passive = delivery == PASSIVE
+    if kind == "ask" and key:
+        return KEY_WITH_ASK
+    if kind == "ask" and passive:
+        return ASK_PASSIVE
+    if key and delivery in ("steer", "interrupt"):
+        return KEY_WITH_LIVE.format(delivery=delivery)
+    if to_all and not (passive and key):
+        return ALL_NEEDS_PASSIVE_KEY
+    if to_all and reply_mode != "none":
+        return ALL_NEEDS_REPLY_NONE
+    if passive and reply_mode == "waiting":
+        return PASSIVE_WAITING
+    return None
+
+
+def _hold(receipt, row, who, *, lineage) -> dict:
+    """Store a passive note ``pending``: nothing is framed or delivered until its next turn."""
+    replaced = record.insert_note(row.pop("message_id"), lineage=lineage, **row)
+    message_id = receipt.message_id
+    if row.get("address") == ALL:
+        sentence = (f"Message {message_id} is held for all sessions of this profile; each gets it "
+                    "at its next turn. It wakes none of them.")
+    else:
+        sentence = (f'Message {message_id} is held for "{receipt.target_title}" until its next '
+                    "turn. It does not wake it.")
+    parts = [sentence]
+    if replaced:
+        parts.append(f"It replaces held message {', '.join(replaced)} (key {row['note_key']}).")
+    elif row.get("note_key"):
+        parts.append(f"A newer message with key {row['note_key']} will replace it while it is held.")
+    parts.append(_answer_sentence(row["reply_mode"], who, message_id))
+    fields = receipt.done("held", " ".join(part for part in parts if part))
+    fields["key"] = row.get("note_key")
+    fields["replaced"] = replaced
+    return fields
+
+
+def _target_lineage(target) -> list:
+    """The target and its compression lineage: "same target" for keyed replacement."""
+    try:
+        from . import replies
+    except ImportError:  # loaded as top-level modules (the unittest layout)
+        import replies
+    return sorted(replies._lineage(target))
 
 
 class _Receipt:

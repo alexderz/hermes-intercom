@@ -274,7 +274,7 @@ class SchemaTests(CliTestBase):
         self.assertEqual(schema["parameters"]["required"], ["action"])
         self.assertNotIn("default", props["reply"])
         self.assertEqual(props["reply"]["enum"], ["none", "requested", "waiting"])
-        self.assertEqual(props["delivery"]["enum"], ["interrupt", "steer", "queue"])
+        self.assertEqual(props["delivery"]["enum"], ["interrupt", "steer", "queue", "passive"])
         self.assertEqual(props["delivery"]["default"], "steer")
         self.assertIn(INTERRUPT, props["delivery"]["description"])
         for name in ("include_runs", "query", "limit", "timeout", "request_id", "to", "message"):

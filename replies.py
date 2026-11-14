@@ -250,7 +250,7 @@ def ask(args: dict, *, session_id=None, ctx=None, lister=None, **_kw) -> dict:
 
     receipt = route.send(session_id, args.get("to"), args.get("message"), ctx=ctx,
                          delivery=args.get("delivery") or "steer", reply_mode="waiting",
-                         kind="ask", lister=lister, on_inserted=on_inserted)
+                         kind="ask", lister=lister, on_inserted=on_inserted, key=args.get("key"))
     message_id = receipt.get("message_id")
     if receipt.get("ok") is not True:
         _drop(message_id)

@@ -42,6 +42,7 @@ _DEFAULT_SINCE = 24 * 3600
 
 # detail -> process exit. 0 is a delivery; 1 is status's missing id; 2 is usage.
 _EXIT = {
+    "usage": 2,
     "reply-missing": 3,
     "empty": 3,
     "ambiguous": 3,
@@ -97,13 +98,16 @@ def register_parser(parser: argparse.ArgumentParser) -> None:
     parser.set_defaults(func=intercom_command)
     subs = parser.add_subparsers(dest="intercom_command", required=True)
     send = subs.add_parser("send", help="Send a message", formatter_class=_help_formatter)
-    send.add_argument("--to", required=True, help="Session id, exact title, Home, or @<project>.")
+    send.add_argument("--to", required=True,
+                      help="Session id, exact title, Home, @<project>, or all (passive with a key).")
     send.add_argument("--message", default=None, help="Message text.")
     send.add_argument("--file", default=None, help="Read the message from PATH, or - for stdin.")
     send.add_argument("--reply", choices=("none", "requested", "waiting"), default="none",
                       help="none (default), requested, or waiting.")
-    send.add_argument("--delivery", choices=("interrupt", "steer", "queue"), default="steer",
-                      help=INTERRUPT_SENTENCE)
+    send.add_argument("--delivery", choices=("interrupt", "steer", "queue", "passive"), default="steer",
+                      help=INTERRUPT_SENTENCE + " passive is held until the other session's next turn and never wakes it.")
+    send.add_argument("--key", default=None,
+                      help="For passive or queue: a newer message with the same key replaces a held one.")
     send.add_argument("--from", dest="from_label", default="cli",
                       help='Script label in the header (default: cli).')
     send.add_argument("--json", action="store_true", help="Print the receipt as JSON.")
@@ -236,6 +240,7 @@ def _cmd_send(args) -> int:
         delivery=args.delivery,
         reply_mode=args.reply,
         script=True,
+        key=args.key,
     )
     if args.json:
         print(json.dumps(receipt, ensure_ascii=False))
@@ -271,6 +276,10 @@ def _applied_phrase(receipt: dict) -> str:
     requested = receipt.get("requested")
     detail = receipt.get("applied_detail")
     message = receipt.get("message") or ""
+    if requested == route.PASSIVE:
+        key = receipt.get("key")
+        keyed = f", key {key}" if key else ""
+        return f"held (until its next turn; it does not wake it{keyed})"
     if applied == "steer":
         return "steered (into its running turn)"
     if applied == "queue" and requested and requested != "queue":
@@ -353,6 +362,7 @@ def _cmd_status(args) -> int:
             "to": _to_label(row),
             "sent": _sent(row),
             "delivery": _delivery_words(row),
+            "key": row.get("note_key"),
             "reply": reply_line,
             "check": check,
             "text": rendered,
@@ -371,6 +381,8 @@ def _status_text(row: dict, reply_line: str, check) -> str:
         f"  delivery  {_delivery_words(row)}",
         f"  reply     {reply_line}",
     ]
+    if row.get("note_key"):
+        lines.append(f"  key       {row['note_key']}")
     parent = row.get("in_reply_to")
     if isinstance(parent, str) and parent:
         # Two spaces after "to" so the message id lines up with the other values.
@@ -390,22 +402,73 @@ def _from_label(row: dict) -> str:
 def _to_label(row: dict) -> str:
     title = row.get("target_title") or ""
     session_id = row.get("target_session_id") or ""
+    if _is_all(row):
+        return "all"
     if session_id:
         return f'"{title}" ({session_id})'
     return f'"{title}"'
 
 
 def _sent(row: dict) -> str:
-    created = row.get("created_at")
-    if not isinstance(created, (int, float)) or isinstance(created, bool):
-        return ""
-    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(created))
+    return _stamp(row.get("created_at"))
 
 
 def _clock(stamp) -> str:
     if not isinstance(stamp, (int, float)) or isinstance(stamp, bool):
         return ""
     return time.strftime("%H:%M:%S", time.localtime(stamp))
+
+
+def _is_all(row: dict) -> bool:
+    return row.get("address") == route.ALL and not row.get("target_session_id")
+
+
+def _note_words(row: dict) -> str:
+    """A passive note: ``held``, ``delivered <time> (turn <id>)`` or ``replaced by <id>``.
+
+    An ``all`` note is ``held for all · handed to N sessions``, N being the
+    confirmed ``note_seen`` rows, then ``· replaced by <id>`` when replaced.
+    """
+    result = row.get("result")
+    detail = row.get("detail") or "replaced"
+    if _is_all(row):
+        words = f"held for all · handed to {_handed_count(row.get('id'))} sessions"
+        return f"{words} · {detail}" if result == "replaced" else words
+    if result == "replaced":
+        turn = row.get("offered_turn")
+        if row.get("delivered_at") is not None and turn:
+            return f"{detail} (handed over in turn {turn})"
+        return detail
+    if result == "delivered":
+        return f"delivered {_stamp(row.get('delivered_at'))} (turn {row.get('offered_turn') or 'unknown'})"
+    return "held"
+
+
+def _handed_count(message_id) -> int:
+    """Confirmed ``note_seen`` rows for this ``all`` note. 0 when none can be read."""
+    path = _record_path()
+    if not isinstance(message_id, str) or not path.is_file():
+        return 0
+    try:
+        conn = _ro(path)
+    except sqlite3.Error:
+        return 0
+    try:
+        found = conn.execute(
+            "SELECT COUNT(*) FROM note_seen WHERE message_id = ? AND delivered_at IS NOT NULL",
+            (message_id,),
+        ).fetchone()
+        return int(found[0]) if found else 0
+    except sqlite3.Error:
+        return 0
+    finally:
+        conn.close()
+
+
+def _stamp(value) -> str:
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return ""
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(value))
 
 
 def _delivery_words(row: dict) -> str:
@@ -417,6 +480,8 @@ def _delivery_words(row: dict) -> str:
         return f"refused ({detail})" if detail else "refused"
     if result == "error":
         return f"error ({detail})" if detail else "error"
+    if row.get("requested") == route.PASSIVE:
+        return _note_words(row)
     applied = row.get("applied")
     word = _APPLIED_WORD.get(applied, applied or "unknown")
     requested = row.get("requested")
@@ -615,6 +680,8 @@ def _log_line(row: dict, by_id: dict) -> str:
     if isinstance(parent, str) and parent:
         suffix = f"  (reply to {parent})"
     target = f'session "{row.get("target_title") or row.get("target_session_id") or ""}"'
+    if _is_all(row):
+        target = "all"
     return (f"{clock}  message {row.get('id')}  {_from_label(row)} → {target}  "
             f"{_log_delivery(row)}  {_log_reply(row, by_id)}{suffix}")
 
@@ -626,12 +693,16 @@ def _log_delivery(row: dict) -> str:
         return f"refused ({detail})" if detail else "refused"
     if result == "error":
         return f"error ({detail})" if detail else "error"
+    key = row.get("note_key")
+    keyed = f" · key {key}" if key else ""
+    if row.get("requested") == route.PASSIVE:
+        return f"passive: {_note_words(row)}{keyed}"
     applied = row.get("applied")
     word = _APPLIED_WORD.get(applied, applied or (result or "unknown"))
     requested = row.get("requested")
     if applied == "queue" and requested and requested != "queue":
-        return f"queued (asked {requested})"
-    return word
+        return f"queued (asked {requested}){keyed}"
+    return f"{word}{keyed}"
 
 
 def _log_reply(row: dict, by_id: dict) -> str:
