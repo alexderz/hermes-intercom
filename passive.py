@@ -59,21 +59,22 @@ def on_pre_llm_call(session_id=None, turn_id=None, **_kw):
     try:
         if not route.injection_allowed():
             return None
-        lineage = replies._lineage(session_id)
-        root = _root(session_id)
+        lineage, root = _lineage_and_root(session_id)
         facts = route._facts(session_id)
         notes = record.offer_notes(turn_id, lineage=sorted(lineage), root_id=root,
                                    include_all=facts["source"] not in address.RUN_SOURCES)
         if not notes:
             return None
+        ctx = _ctx["ctx"]
+        text = frame.held_notes(notes, replies._user_name(ctx),
+                                shared_line=_shared_line(notes, session_id, facts, ctx))
+        # Registered only once the frame exists: a turn is never confirmed for notes it did not get.
         with _lock:
             # An earlier turn of this lineage that never made a request no longer counts.
             for stale in [t for t, r in _offered.items() if r == root]:
                 del _offered[stale]
             _offered[turn_id] = root
-        ctx = _ctx["ctx"]
-        return {"context": frame.held_notes(notes, replies._user_name(ctx),
-                                            shared_line=_shared_line(notes, session_id, facts, ctx))}
+        return {"context": text}
     except Exception as exc:  # health: allow BLE001 -- log the type only; a note body can be in the traceback
         logger.warning("intercom: held-note handover failed (%s)", type(exc).__name__)
         return None
@@ -101,27 +102,36 @@ def _usable(value) -> bool:
     return isinstance(value, str) and value != ""
 
 
-def _root(session_id: str) -> str:
-    """The session's compression lineage root; the session id when it has no lineage row."""
+def _lineage_and_root(session_id: str) -> tuple[set, str]:
+    """The session, its compression ancestors and its tip (as ``replies._lineage``), and the
+    lineage root, from one read. The root is the session id when it has no lineage row."""
+    ids = {session_id}
     try:
         from hermes_state import SessionDB
 
         db = SessionDB(read_only=True)
-    except Exception:  # health: allow BLE001 -- the root falls back to this session id
-        return session_id
+    except Exception:  # health: allow BLE001 -- lineage and root fall back to this session id
+        return ids, session_id
+    chain = []
     try:
-        lineage = db.get_compression_lineage(session_id) or []
-    except Exception:  # health: allow BLE001 -- the root falls back to this session id
-        lineage = []
+        chain = db.get_compression_lineage(session_id) or []
+        ids.update(chain)
+        tip = db.get_compression_tip(session_id)
+        if tip:
+            ids.add(tip)
+    except Exception:  # health: allow BLE001 -- a lineage miss still hands over this session's notes
+        logger.debug("intercom compression lineage was not read")
     finally:
         db.close()
-    return lineage[0] if lineage else session_id
+    return ids, (chain[0] if chain else session_id)
 
 
 def _shared_line(notes, session_id: str, facts: dict, ctx) -> str:
     """This session's shared-chat line when a note lands in a shared chat, else ``""``.
 
     Per-target notes use the scope stored at send; ``all`` notes this session's scope now.
+    A session with no readable row is ``shared`` (``scope.chat_scope`` fails closed), so it gets
+    the line without chat details. That is intended.
     """
     shared = any(n.get("target_session_id") and n.get("target_chat_scope") == scope.SHARED
                  for n in notes)

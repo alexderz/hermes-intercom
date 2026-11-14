@@ -684,7 +684,9 @@ def _held_body(note: dict, user: str) -> str:
 def held_notes(notes, user_name: str, *, shared_line: str = "") -> str:
     """The text a target reads at turn start for its held *notes* (record rows, oldest first).
 
-    Compact, one line per note, when no note asks for a reply; otherwise the full
+    Compact, one line per note, when no note asks for a reply (a body's lines are
+    joined with `` ⏎ `` after relabelling, so every line of peer text carries the
+    ``not from <user>`` prefix); otherwise the full
     block, with the answering instructions in its first line and
     :data:`HELD_END` last. *shared_line* (this session's shared-chat line, or
     ``""``) follows the notes in the compact form and the first line in the full one.
@@ -693,7 +695,7 @@ def held_notes(notes, user_name: str, *, shared_line: str = "") -> str:
     if all(note.get("reply_mode") == "none" for note in notes):
         lines = [
             f"📡 Held note ({sanitize_title(note.get('sender_label'))}, {_held_time(note)}; "
-            f"not from {user}, no reply): {_held_body(note, user)}"
+            f"not from {user}, no reply): {' ⏎ '.join(_held_body(note, user).splitlines())}"
             for note in notes
         ]
         if shared_line:
