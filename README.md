@@ -211,7 +211,7 @@ Choose the delivery by what the target must do and when:
 
 `profile` on the tool's `send` and `list` names another Hermes profile on this machine. Without it, send and list stay in the sender's profile. Naming the sender's own profile is the same as leaving it off.
 
-`list` with `profile` lists that profile's sessions. `send` with `profile` delivers into one session there, by session id, exact title or `Home`. A bot is reached by its exact title:
+`list` shows the profile's Bot Chat, the session titled exactly `Bot Chat`. It is a hidden session, so the owner's own session list leaves it out; `list` adds it. Other hidden sessions stay hidden. `list` with `profile` lists that profile's sessions, including its Bot Chat. `send` with `profile` delivers into one session there, by session id, exact title or `Home`. A bot is reached by its exact title:
 
 ```text
 intercom(action="send", to="Bot Chat", profile="<bot profile>", message=..., reply="none")

@@ -99,10 +99,15 @@ def list_sessions(*, include_runs=False, query=None, limit=None, sender=None, li
     """Discovery listing: id (compression tip), title, project, last active, state.
 
     Rows come from the lister: stored ``session.list`` with ``picker`` true, then live
-    ``session.list`` (also ``picker`` true); open sessions the stored page missed are added. ``cron``, ``subagent`` and ``oneshot`` are left out unless
-    ``include_runs`` is truthy. ``query`` is a case-insensitive substring of title or
-    project. Newest ``last_active`` first; ``limit`` defaults to 30. The sender's own
-    session is kept and marked ``(this session)``.
+    ``session.list`` (also ``picker`` true); open sessions the stored page missed are added.
+    The canonical Bot Chat is hidden, so those lists omit it. The session titled exactly
+    ``Bot Chat`` is read from ``state.db`` and added when its compression tip is not already
+    listed. Its state comes from the live list (``running`` / ``idle``, else ``closed``)
+    and its project is resolved like any other row. Other hidden sessions stay hidden.
+    ``cron``, ``subagent`` and ``oneshot`` are left out unless ``include_runs`` is truthy.
+    ``query`` is a case-insensitive substring of title or project. Newest ``last_active``
+    first; ``limit`` defaults to 30. The sender's own session is kept and marked
+    ``(this session)``.
     """
     if lister is None:
         lister = _owner_lister
@@ -154,6 +159,9 @@ def list_sessions(*, include_runs=False, query=None, limit=None, sender=None, li
             if tip in merged:
                 continue
             merged[tip] = _list_item(row, tip, db, live_index, projects)
+        # Hidden rows never appear in the owner's session.list. The canonical Bot Chat is
+        # one of them, and it is the session a profile is reached through.
+        _include_canonical_bot_chat(merged, db, live_index, projects)
         sessions = list(merged.values())
         needle = query.strip().casefold() if isinstance(query, str) else ""
         if needle:
@@ -436,6 +444,71 @@ def _row_keys(row: dict, db) -> list[str]:
 def _primary_id(row: dict) -> str:
     for field in ("id", "session_id"):
         value = row.get(field)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _include_canonical_bot_chat(merged: dict, db, live_index: dict, projects) -> None:
+    """Add the session titled exactly ``Bot Chat`` when the lister left its tip out.
+
+    ``get_session_by_title`` is the published exact-title read. A retired canonical chat
+    (title released) is ``None``, so nothing is added when no Bot Chat row exists.
+    """
+    if db is None:
+        return
+    titled = db.get_session_by_title(db.CANONICAL_BOT_CHAT_TITLE)
+    if not isinstance(titled, dict):
+        return
+    raw = titled.get("id")
+    if not isinstance(raw, str) or not raw.strip():
+        return
+    raw = raw.strip()
+    tip = _tip(db, raw)
+    if tip in merged:
+        return
+    current = titled
+    if tip != raw:
+        loaded = db.get_session(tip)
+        if isinstance(loaded, dict):
+            current = loaded
+    merged[tip] = _list_item(_session_lister_row(titled, current), tip, db, live_index, projects)
+
+
+def _session_lister_row(titled: dict, current: dict) -> dict:
+    """A ``state.db`` session in the shape ``_list_item`` already understands.
+
+    State then comes from the live list, and the project from the workspace a picker
+    row carries (git repo root, else cwd). The title stays the canonical one: a
+    compression tip often has none of its own.
+    """
+    title = titled.get("title")
+    if not (isinstance(title, str) and title.strip()):
+        title = current.get("title")
+    source = current.get("source")
+    if not isinstance(source, str):
+        source = titled.get("source")
+    return {
+        "id": current.get("id") or titled.get("id"),
+        "title": title if isinstance(title, str) else "",
+        "source": source if isinstance(source, str) else "",
+        "last_active_at": _session_last_active(current),
+        "workspace": _session_workspace(current) or _session_workspace(titled),
+    }
+
+
+def _session_last_active(session: dict):
+    for key in ("last_activity_at", "started_at"):
+        value = session.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return value
+    return None
+
+
+def _session_workspace(session: dict) -> str:
+    """Git repo root, else cwd: the workspace a picker row carries for this session."""
+    for key in ("git_repo_root", "cwd"):
+        value = session.get(key)
         if isinstance(value, str) and value.strip():
             return value.strip()
     return ""

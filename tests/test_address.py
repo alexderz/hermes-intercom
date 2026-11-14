@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import json
 import os
 import shutil
 import sqlite3
@@ -121,8 +122,8 @@ class AddressTests(unittest.TestCase):
         self.db = SessionDB()
         return self.db
 
-    def add_session(self, sid, title=None, source="cli", parent=None, started_at=None, end=None):
-        kwargs = {}
+    def add_session(self, sid, title=None, source="cli", parent=None, started_at=None, end=None, **extra):
+        kwargs = dict(extra)
         if parent:
             kwargs["parent_session_id"] = parent
         self.db.create_session(sid, source=source, **kwargs)
@@ -834,6 +835,152 @@ class AddressTests(unittest.TestCase):
         listed = address.list_sessions(lister=_quiet_lister(rows, live))
         self.assertEqual(listed["sessions"][0]["id"], "local-tip")
         self.assertEqual(listed["sessions"][0]["state"], "idle")
+
+    def test_list_adds_a_hidden_bot_chat_and_no_other_hidden_session(self):
+        work = self.home / "work" / "review"
+        self.make_projects(
+            [{"id": "p-review", "slug": "reviewer", "name": "Reviewer"}],
+            owner_column=False,
+            folders=[("p-review", str(work))],
+        )
+        self.open_writer()
+        self.add_session("local-notes", title="Notes", source="cli", started_at=10)
+        self.add_session("local-secret", title="Secret", source="cli", started_at=9, cwd=str(work))
+        self.db.set_session_hidden("local-secret", True)
+        self.add_session("local-numbered", title="Bot Chat #2", source="cli", started_at=8)
+        self.db.set_session_hidden("local-numbered", True)
+        self.add_session("local-lower", title="bot chat", source="cli", started_at=7)
+        self.db.set_session_hidden("local-lower", True)
+        self.close_writer()
+        stored = [{
+            "id": "local-notes", "title": "Notes", "source": "cli", "running": False,
+            "last_active_at": 10, "workspace": "",
+        }]
+        # No row titled exactly "Bot Chat": the other hidden sessions stay hidden.
+        absent = address.list_sessions(lister=_quiet_lister(stored, []))
+        self.assertEqual([item["id"] for item in absent["sessions"]], ["local-notes"])
+
+        self.open_writer()
+        self.add_session(
+            "local-bot", title="Bot Chat", source="tui", started_at=4,
+            cwd=str(self.home / "scratch"), git_repo_root=str(work),
+        )
+        self.db.set_session_hidden("local-bot", True)
+        self.close_writer()
+        listed = address.list_sessions(lister=_quiet_lister(stored, []))
+        by_id = {item["id"]: item for item in listed["sessions"]}
+        self.assertEqual(set(by_id), {"local-notes", "local-bot"})
+        bot = by_id["local-bot"]
+        self.assertEqual(bot["title"], "Bot Chat")
+        self.assertEqual(bot["state"], "closed")
+        self.assertEqual(bot["project"], "Reviewer")
+        self.assertEqual(bot["source"], "tui")
+        self.assertEqual(bot["last_active"], 4)
+        queried = address.list_sessions(query="bot", lister=_quiet_lister([], []))
+        self.assertEqual([item["id"] for item in queried["sessions"]], ["local-bot"])
+        missed = address.list_sessions(query="notes", lister=_quiet_lister(stored, []))
+        self.assertEqual([item["id"] for item in missed["sessions"]], ["local-notes"])
+
+    def test_list_bot_chat_state_comes_from_the_live_list(self):
+        self.open_writer()
+        self.add_session("local-bot", title="Bot Chat", source="tui", started_at=1)
+        self.db.set_session_hidden("local-bot", True)
+        self.close_writer()
+        closed = address.list_sessions(lister=_quiet_lister([], []))
+        self.assertEqual([item["state"] for item in closed["sessions"]], ["closed"])
+        running = address.list_sessions(lister=_quiet_lister([], [{
+            "id": "local-bot", "title": "Bot Chat", "source": "tui", "running": True,
+        }]))
+        self.assertEqual(len(running["sessions"]), 1)
+        self.assertEqual(running["sessions"][0]["id"], "local-bot")
+        self.assertEqual(running["sessions"][0]["state"], "running")
+        idle = address.list_sessions(lister=_quiet_lister([], [{
+            "id": "local-bot", "title": "Bot Chat", "source": "tui", "running": False,
+        }]))
+        self.assertEqual(len(idle["sessions"]), 1)
+        self.assertEqual(idle["sessions"][0]["state"], "idle")
+
+    def test_list_does_not_duplicate_a_bot_chat_the_lister_returned(self):
+        self.open_writer()
+        self.add_session("local-bot-root", title="Bot Chat", source="tui", started_at=1)
+        self.db.end_session("local-bot-root", "compression")
+        self.add_session("local-bot-tip", parent="local-bot-root", source="tui", started_at=2)
+        self.db.set_session_hidden("local-bot-root", True)
+        self.close_writer()
+        # Omitted by the lister: one row, at the compression tip.
+        omitted = address.list_sessions(lister=_quiet_lister([], []))
+        self.assertEqual([item["id"] for item in omitted["sessions"]], ["local-bot-tip"])
+        self.assertEqual(omitted["sessions"][0]["title"], "Bot Chat")
+        self.assertEqual(omitted["sessions"][0]["state"], "closed")
+        # The lister already returned the chain (by its root). Same tip, still one row,
+        # keeping the lister's own last-active and state.
+        listed = address.list_sessions(lister=_quiet_lister([{
+            "id": "local-bot-root", "title": "Bot Chat", "source": "tui", "running": True,
+            "last_active_at": 20,
+        }], []))
+        self.assertEqual(len(listed["sessions"]), 1)
+        item = listed["sessions"][0]
+        self.assertEqual(item["id"], "local-bot-tip")
+        self.assertEqual(item["last_active"], 20)
+        self.assertEqual(item["state"], "running")
+
+    def test_list_with_profile_shows_the_named_profiles_bot_chat(self):
+        named = self.home / "profiles" / "spike"
+        named.mkdir(parents=True)
+        (named / "config.yaml").write_text(
+            "plugins:\n  enabled:\n    - intercom\n",
+            encoding="utf-8",
+        )
+        self.open_writer()
+        self.add_session("local-default-bot", title="Bot Chat", source="tui", started_at=1)
+        self.db.set_session_hidden("local-default-bot", True)
+        self.close_writer()
+        from hermes_state import SessionDB
+
+        writer = SessionDB(db_path=named / "state.db")
+        try:
+            writer.create_session("local-spike-bot", source="tui")
+            writer.set_session_title("local-spike-bot", "Bot Chat")
+            writer.set_session_hidden("local-spike-bot", True)
+            writer.create_session("local-spike-secret", source="cli")
+            writer.set_session_title("local-spike-secret", "Secret")
+            writer.set_session_hidden("local-spike-secret", True)
+        finally:
+            writer.close()
+
+        name = "hermes_intercom_test_address_bot"
+        for key in list(sys.modules):
+            if key == name or key.startswith(name + "."):
+                sys.modules.pop(key, None)
+        spec = importlib.util.spec_from_file_location(
+            name, PACKAGE_DIR / "__init__.py", submodule_search_locations=[str(PACKAGE_DIR)],
+        )
+        plugin = importlib.util.module_from_spec(spec)
+        sys.modules[name] = plugin
+        try:
+            spec.loader.exec_module(plugin)
+            client = importlib.import_module(name + ".client")
+            seen = []
+
+            def lister(scope="live", picker=False):
+                from hermes_constants import get_hermes_home
+
+                seen.append(Path(get_hermes_home()))
+                return {"ok": True, "sessions": []}
+
+            with mock.patch.object(client, "list_sessions", lister):
+                result = json.loads(plugin.handle({"action": "list", "profile": "spike"}))
+        finally:
+            for key in list(sys.modules):
+                if key == name or key.startswith(name + "."):
+                    sys.modules.pop(key, None)
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["profile"], "spike")
+        self.assertEqual([item["id"] for item in result["sessions"]], ["local-spike-bot"])
+        self.assertEqual(result["sessions"][0]["title"], "Bot Chat")
+        self.assertEqual(result["sessions"][0]["state"], "closed")
+        self.assertEqual(seen, [named, named])
 
     def test_none_last_active_sorts_last(self):
         rows = [
