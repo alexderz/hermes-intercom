@@ -23,7 +23,14 @@ wake marker: ``wake_admission``, the submission id of the wake line its send (or
 the send it inherited from) put in Hermes's queue, and ``wake_instance``, the
 owner instance that took it. A wake is outstanding while its instance is the
 current owner's and no turn has been offered the row; a marker of another
-instance is dead. Older files get these columns from the guarded migration in
+instance is dead.
+
+A passive note with a deadline has ``wake_at`` (``created_at + within`` minutes).
+Once it is due, the deadline sweep (``deadline.py``) ``claim_wake``s it: the same
+marker, written with ``wake_claimed_at``, then ``wake_fired`` (the owner's
+``admission_id``) or ``release_wake``. The wake's turn consumes it
+(``wake_turn``, ``woken_at``) in ``offer_notes``. A consumed wake is never sent
+again. Older files get these columns from the guarded migration in
 ``connect()``.
 
 Two writers share the file. The sender ``insert``s its row with an empty result,
@@ -35,7 +42,7 @@ owner's reply hook ``update``s the reply fields and ``insert``s the new reply ro
 ``claim_echo`` sets ``echoed_at`` once. At turn start the passive hook
 ``offer_notes`` (``offered_turn``, or a ``note_seen`` row for an ``all`` note) and
 at the turn's first model request ``confirm_notes`` (``delivered_at``). Lookups are ``get`` (id), ``by_span_hash``,
-``by_target_lineage`` and ``confirmed_in_turn``. Nothing is pruned, retried or
+``by_target_lineage``, ``confirmed_in_turn`` and ``due_notes``. Nothing is pruned, retried or
 walked through a status ladder.
 """
 
@@ -109,7 +116,11 @@ CREATE TABLE IF NOT EXISTS messages (
   offered_turn TEXT,
   sender_profile TEXT,
   wake_admission TEXT,
-  wake_instance TEXT
+  wake_instance TEXT,
+  wake_at REAL,
+  wake_claimed_at REAL,
+  wake_turn TEXT,
+  woken_at REAL
 )
 """
 
@@ -120,6 +131,10 @@ _ADDED_COLUMNS = (
     ("sender_profile", "TEXT"),
     ("wake_admission", "TEXT"),
     ("wake_instance", "TEXT"),
+    ("wake_at", "REAL"),
+    ("wake_claimed_at", "REAL"),
+    ("wake_turn", "TEXT"),
+    ("woken_at", "REAL"),
 )
 
 # Its own statement: conn.execute runs one statement only.
@@ -193,6 +208,7 @@ def insert(
     created_at: float | None = None,
     note_key: str | None = None,
     sender_profile: str | None = None,
+    wake_at: float | None = None,
 ) -> None:
     """Insert the row before delivery. ``result`` and ``header_sha`` stay empty.
 
@@ -279,6 +295,60 @@ def wake_failed(wake_admission: str) -> None:
     """The wake was not taken: its marker is dead, so its pending row rides the next turn."""
     _run_write(lambda conn: conn.execute(
         "UPDATE messages SET wake_instance = NULL WHERE wake_admission = ?", (wake_admission,)))
+
+
+def due_notes(instance_id: str, now: float | None = None) -> list[dict]:
+    """The deadline notes due now, oldest first: see ``_DUE``."""
+    when = time.time() if now is None else now
+
+    def read(conn: sqlite3.Connection) -> list[dict]:
+        return [_as_dict(r) for r in conn.execute(
+            f"SELECT * FROM messages WHERE {_DUE} ORDER BY created_at, id",
+            (PASSIVE, when, instance_id))]
+
+    return _run_read(read)
+
+
+def claim_wake(message_id: str, *, instance_id: str, wake_admission: str,
+               now: float | None = None) -> bool:
+    """Write the wake marker on a deadline note only while it is still due. True when claimed.
+
+    One ``BEGIN IMMEDIATE``: the marker is (*wake_admission*, *instance_id*) with
+    ``wake_claimed_at``, so a second sweep finds the wake live and leaves the row alone.
+    """
+    when = time.time() if now is None else now
+
+    def write(conn: sqlite3.Connection) -> bool:
+        cur = conn.execute(
+            f"UPDATE messages SET wake_admission = ?, wake_instance = ?, wake_claimed_at = ? "
+            f"WHERE id = ? AND {_DUE}",
+            (wake_admission, instance_id, when, message_id, PASSIVE, when, instance_id))
+        return cur.rowcount == 1
+
+    return _run_write(write)
+
+
+def wake_fired(message_id: str, wake_admission: str, admission_id, instance_id) -> None:
+    """The owner took the deadline wake: the marker gets its admission id and answering instance."""
+    def write(conn: sqlite3.Connection) -> None:
+        conn.execute("UPDATE messages SET admission_id = ? WHERE id = ? AND wake_admission = ?",
+                     (admission_id if isinstance(admission_id, str) else None, message_id,
+                      wake_admission))
+        if isinstance(instance_id, str) and instance_id:
+            conn.execute("UPDATE messages SET wake_instance = ? WHERE id = ? AND wake_admission = ? "
+                         "AND wake_turn IS NULL", (instance_id, message_id, wake_admission))
+
+    _run_write(write)
+
+
+def release_wake(message_id: str, wake_admission: str) -> None:
+    """Release an unconsumed claim: the marker is dead, so the note is held and due again.
+
+    ``wake_admission`` stays: a wake line that did arrive is still a wake, never a message.
+    """
+    _run_write(lambda conn: conn.execute(
+        "UPDATE messages SET wake_instance = NULL WHERE id = ? AND wake_admission = ? "
+        "AND wake_turn IS NULL", (message_id, wake_admission)))
 
 
 def update(message_id: str, **fields) -> bool:
@@ -384,11 +454,14 @@ def by_target_lineage(session_ids: Sequence[str]) -> list[dict]:
 
 def offer_notes(turn_id: str, *, lineage: Sequence[str], root_id: str,
                 include_all: bool, wake_keys: Sequence[str] = (),
-                instance_id: str | None = None) -> list[dict]:
+                instance_id: str | None = None, woken: Sequence[str] = ()) -> list[dict]:
     """Offer this turn the held notes of one target lineage, oldest first.
 
-    One ``BEGIN IMMEDIATE``. Per-target notes: the ``pending`` passive rows whose
-    target is in *lineage*, and the ``pending`` keyed queued rows whose key is in
+    One ``BEGIN IMMEDIATE``. *woken* are the deadline notes whose wake this turn carries: each
+    wake is consumed (``wake_turn = turn_id``, ``woken_at``) unless already consumed.
+    Per-target notes: the ``pending`` passive rows whose target is in *lineage*, except a
+    deadline note whose wake is live for *instance_id* and not in *woken*; and the
+    ``pending`` keyed queued rows whose key is in
     *wake_keys* (this turn carries their wake) or whose wake is not outstanding for
     *instance_id* (a turn was already offered them, or the marker is dead); each
     gets ``offered_turn = turn_id``. With
@@ -402,12 +475,16 @@ def offer_notes(turn_id: str, *, lineage: Sequence[str], root_id: str,
 
     def write(conn: sqlite3.Connection) -> list[dict]:
         notes = []
+        consumed = set(woken)
+        for message_id in consumed:
+            conn.execute("UPDATE messages SET wake_turn = ?, woken_at = ? "
+                         "WHERE id = ? AND wake_turn IS NULL", (turn_id, time.time(), message_id))
         if ids:
-            notes = [_as_dict(r) for r in conn.execute(
+            notes = [r for r in map(_as_dict, conn.execute(
                 f"SELECT * FROM messages WHERE requested = ? AND result = 'pending' "
                 f"AND delivered_at IS NULL AND target_session_id IN ({marks})",
                 (PASSIVE, *ids),
-            )]
+            )) if r["id"] in consumed or not _deadline_live(r, instance_id)]
             keys = set(wake_keys)
             notes.extend(r for r in map(_as_dict, conn.execute(
                 f"SELECT * FROM messages WHERE requested = ? AND result = 'pending' "
@@ -502,7 +579,7 @@ _INSERT_COLUMNS = (
     "id", "kind", "in_reply_to", "sender_session_id", "sender_label", "sender_source",
     "target_session_id", "target_title", "address", "body", "sender_chat_scope",
     "target_chat_scope", "reply_mode", "requested", "request_id", "created_at",
-    "note_key", "sender_profile", "wake_admission", "wake_instance",
+    "note_key", "sender_profile", "wake_admission", "wake_instance", "wake_at",
 )
 
 
@@ -529,6 +606,20 @@ def _replace(conn: sqlite3.Connection, ids: Sequence[str], message_id: str) -> N
     for old in ids:
         conn.execute("UPDATE messages SET result = 'replaced', detail = ? WHERE id = ?",
                      (f"replaced by {message_id}", old))
+
+
+# A deadline note is due: held, its deadline passed, its wake never consumed and not live.
+# Parameters: PASSIVE, now, the owner's instance id.
+_DUE = ("requested = ? AND result = 'pending' AND delivered_at IS NULL "
+        "AND target_session_id IS NOT NULL AND wake_at IS NOT NULL AND wake_at <= ? "
+        "AND wake_turn IS NULL AND (wake_instance IS NULL OR wake_instance != ?)")
+
+
+def _deadline_live(row: dict, instance_id) -> bool:
+    """A deadline note's wake is live: claimed by the current owner and not yet consumed."""
+    return (row.get("wake_at") is not None and bool(row.get("wake_admission"))
+            and row.get("wake_turn") is None and isinstance(instance_id, str) and instance_id != ""
+            and row.get("wake_instance") == instance_id)
 
 
 def _wake_outstanding(row: dict, instance_id) -> bool:

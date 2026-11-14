@@ -478,7 +478,7 @@ class MigrationTests(KeyedQueueTestBase):
         directory = self.record_path().parent
         directory.mkdir(parents=True, exist_ok=True)
         os.chmod(directory, 0o700)
-        schema = record._SCHEMA.replace(",\n  wake_admission TEXT,\n  wake_instance TEXT", "")
+        schema = record._SCHEMA[:record._SCHEMA.index(",\n  wake_admission TEXT")] + "\n)\n"
         self.assertNotIn("wake_", schema)
         conn = sqlite3.connect(self.record_path())
         try:

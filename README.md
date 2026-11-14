@@ -143,6 +143,8 @@ hermes intercom status MESSAGE_ID [--json]
 hermes intercom log [--to ADDRESS] [--from LABEL] [--since 30s|15m|24h|7d] [--json]
 hermes intercom reboot-notice --minutes N [--reason TEXT] [--state-file PATH]
 hermes intercom resume-after-reboot [--max-age 6h] [--state-file PATH]
+hermes intercom send --to "Planner" --message "..." --delivery passive --within 30
+hermes intercom wake-due
 ```
 
 `--reply` defaults to `none` for scripts. `--from` is the script label in the frame header (default `cli`). `log` defaults to the last 24 hours.
@@ -159,6 +161,8 @@ Exit codes:
 | 5 | the owner is not reachable (`no-owner`, `owner-restarting`, `not-reachable`) |
 | 6 | `delivery-unknown`: the connection was lost while the owner was admitting it; check `status` before sending again |
 
+`wake-due` (see "Deadlines") prints nothing and exits 0, or 1 when the sweep could not run at all.
+
 `reboot-notice` exits 0 once its arguments parse (2 on a usage error). `resume-after-reboot` exits 0, 2 (usage, or no boot time), 5 (no owner after waiting), or 4 if the gateway refuses the listing.
 
 ## Trust model
@@ -171,6 +175,20 @@ Exit codes:
   - Sending to a shared chat is allowed: that is the operator's choice. The frame tells the target who else reads.
 - **The record.** Every message, receipt and reply is stored in one SQLite file, `plugin-data/intercom/record.db` in the profile. The directory is `0700`; the database and its `-wal`/`-shm` files are `0600`, created owner-only on first open and re-checked on every open. Nothing is pruned. `status` and `log` read it.
 - **Consent** (`allow_gateway_injection`) is checked on every delivery, read fresh from the config.
+
+## Deadlines
+
+A per-target passive note can carry a deadline: `within` (whole minutes, at least 5) on the tool's `send`, or `--within MINUTES` on the CLI. The note is held as usual and handed over at the target's next turn. If it is still held when the deadline passes, the target is woken once, through Hermes's queue, and that turn carries the note together with any other held notes. A note delivered earlier causes no wake. The receipt reads `held (wakes by HH:MM if not run)`; `status` shows `wakes by HH:MM`, then `woken <time> (turn <id>)` once the wake's turn has started. A keyed note replaced before its deadline takes the new note's `within`, or none if the new one has none.
+
+These are refused before anything is recorded (CLI exit 2), with the reason:
+
+- `within` with `to: all`: it would wake every session;
+- `within` with `steer`, `queue` or `interrupt`: they hand the message over at once;
+- `within` under 5, or not a whole number.
+
+Who fires it: the gateway itself, at the first kanban dispatcher tick after the deadline (`kanban.dispatch_interval_seconds`, 60 s by default; the first tick runs about 5 s after the gateway starts, so a deadline that passed while it was down fires then). No job is installed. Nothing fires while `hermes pause` is engaged; deadlines that came due meanwhile fire after resume. One sweep covers every profile on the machine whose config enables intercom, so deadlines on notes sent to another profile (`profile`) are fired by the same sweep.
+
+With `kanban.dispatch_in_gateway: false`, or with intercom disabled in the default profile, the gateway does not run the sweep. Deadlines then fire only when `hermes intercom wake-due` runs. It runs the same sweep once in the foreground; the operator may schedule it, and nothing schedules it for you.
 
 ## Reboots
 

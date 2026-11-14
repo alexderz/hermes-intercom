@@ -6,6 +6,7 @@ defaults to ``none``. ``--no-reply`` is not a flag, so argparse reports it as
 a usage error (exit 2).
 
 ``reboot-notice`` and ``resume-after-reboot`` (README, "Reboots") warn running sessions before a planned reboot and wake them after boot.
+``wake-due`` runs the deadline sweep once (README, "Deadlines").
 Delivery rules are unchanged: no caps, holds, retries or approval gates, and
 one send per session per boot.
 """
@@ -22,10 +23,11 @@ import time
 from pathlib import Path
 
 try:
-    from . import address, client, replies, route
+    from . import address, client, deadline, replies, route
 except ImportError:  # loaded as a top-level module (the unittest layout)
     import address
     import client
+    import deadline
     import replies
     import route
 
@@ -108,6 +110,9 @@ def register_parser(parser: argparse.ArgumentParser) -> None:
                       help=INTERRUPT_SENTENCE + " passive is held until the other session's next turn and never wakes it.")
     send.add_argument("--key", default=None,
                       help="For passive or queue: a newer message with the same key replaces a held one.")
+    # A string, so route.send refuses a bad value in plain words (exit 2), as the tool does.
+    send.add_argument("--within", default=None, metavar="MINUTES",
+                      help="For passive: wake the target after MINUTES (at least 5) if it has not run.")
     send.add_argument("--from", dest="from_label", default="cli",
                       help='Script label in the header (default: cli).')
     send.add_argument("--json", action="store_true", help="Print the receipt as JSON.")
@@ -170,6 +175,13 @@ def register_parser(parser: argparse.ArgumentParser) -> None:
     resume.add_argument("--boot-time", type=int, default=None, help=argparse.SUPPRESS)
     resume.set_defaults(func=intercom_command)
 
+    wake_due = subs.add_parser(
+        "wake-due",
+        help="Wake the targets of held notes whose deadline passed",
+        formatter_class=_help_formatter,
+    )
+    wake_due.set_defaults(func=intercom_command)
+
 
 def main(argv=None) -> int:
     """Parse ``argv`` (without the ``intercom`` word) and return the exit code."""
@@ -199,9 +211,11 @@ def intercom_command(args: argparse.Namespace) -> int:
         return _cmd_reboot_notice(args)
     if verb == "resume-after-reboot":
         return _cmd_resume_after_reboot(args)
+    if verb == "wake-due":
+        return _cmd_wake_due(args)
     print(
         "usage: hermes intercom "
-        "{send,list,status,log,reboot-notice,resume-after-reboot}",
+        "{send,list,status,log,reboot-notice,resume-after-reboot,wake-due}",
         file=sys.stderr,
     )
     return 2
@@ -241,6 +255,7 @@ def _cmd_send(args) -> int:
         reply_mode=args.reply,
         script=True,
         key=args.key,
+        within=args.within,
     )
     if args.json:
         print(json.dumps(receipt, ensure_ascii=False))
@@ -279,6 +294,8 @@ def _applied_phrase(receipt: dict) -> str:
     if requested == route.PASSIVE:
         key = receipt.get("key")
         keyed = f", key {key}" if key else ""
+        if receipt.get("wake_at") is not None:
+            return f"held (wakes by {route.wake_clock(receipt['wake_at'])} if not run{keyed})"
         return f"held (until its next turn; it does not wake it{keyed})"
     if requested == "queue" and receipt.get("key"):
         if receipt.get("receipt") == "queued":
@@ -301,6 +318,14 @@ def _applied_phrase(receipt: dict) -> str:
     if applied == "start":
         return "started (was idle; a turn started)"
     return str(applied or "delivered")
+
+
+def _cmd_wake_due(_args) -> int:
+    """One deadline sweep in the foreground (``deadline.sweep``). Silent; 1 only when it could not run."""
+    if deadline.sweep():
+        return 0
+    print("The deadline sweep could not run; see the log.", file=sys.stderr)
+    return 1
 
 
 def _cmd_list(args) -> int:
@@ -452,8 +477,22 @@ def _note_words(row: dict) -> str:
             return f"{detail} (handed over in turn {turn})"
         return detail
     if result == "delivered":
-        return f"delivered {_stamp(row.get('delivered_at'))} (turn {row.get('offered_turn') or 'unknown'})"
-    return "queued (replaceable)" if _keyed_queue(row) else "held"
+        words = f"delivered {_stamp(row.get('delivered_at'))} (turn {row.get('offered_turn') or 'unknown'})"
+        return f"{words}{_deadline_words(row)}"
+    if _keyed_queue(row):
+        return "queued (replaceable)"
+    return f"held{_deadline_words(row)}"
+
+
+def _deadline_words(row: dict) -> str:
+    """`` · wakes by HH:MM`` for a held deadline note, `` · woken <time> (turn <id>)`` once its
+    wake turn started; nothing for a note without a deadline or delivered without a wake."""
+    if row.get("wake_turn"):
+        return f" · woken {_stamp(row.get('woken_at'))} (turn {row['wake_turn']})"
+    wake_at = row.get("wake_at")
+    if row.get("result") == "pending" and isinstance(wake_at, (int, float)):
+        return f" · wakes by {route.wake_clock(wake_at)}"
+    return ""
 
 
 def _handed_count(message_id) -> int:

@@ -21,6 +21,12 @@ longer outstanding: a turn was already offered it, or its marker names another o
 (the owner restarted and Hermes's in-memory queue went with it). Then it rides as a held note.
 The owner's instance id is discovered once per process.
 
+A passive note with a deadline (``within``) is woken by ``deadline.sweep`` once it is due: a framed
+wake line in Hermes's queue, its span hash on the note's row. The wake's turn finds that span the
+same way, consumes the wake (``wake_turn``) and is offered the target's held notes, that one
+included, framed as held notes. While its wake is live (claimed by the current owner instance and
+not consumed) the note is offered to no other turn; a dead wake leaves it an ordinary held note.
+
 A turn that makes no model request (vetoed, or a runtime that does not carry plugin text) leaves
 its notes held; the next turn offers them again. Once the first request is built the notes are
 in the saved user message, so a later failure still counts them delivered. A steer starts no
@@ -73,10 +79,12 @@ def on_pre_llm_call(session_id=None, turn_id=None, user_message=None, **_kw):
             return None
         lineage, root = _lineage_and_root(session_id)
         facts = route._facts(session_id)
-        keys = _wake_keys(user_message, lineage)
+        found = replies.find_messages([replies._text(user_message)])
+        keys = _wake_keys(found, lineage)
         notes = record.offer_notes(turn_id, lineage=sorted(lineage), root_id=root,
                                    include_all=facts["source"] not in address.RUN_SOURCES,
-                                   wake_keys=sorted(keys), instance_id=_owner_instance())
+                                   wake_keys=sorted(keys), instance_id=_owner_instance(),
+                                   woken=sorted(_deadline_wakes(found, lineage)))
         if not notes:
             return None
         ctx = _ctx["ctx"]
@@ -122,11 +130,18 @@ def _usable(value) -> bool:
     return isinstance(value, str) and value != ""
 
 
-def _wake_keys(user_message, lineage) -> set:
-    """The keys of the keyed-queue wakes framed in this turn's prompt, for this lineage."""
-    return {row["note_key"] for row, _span in replies.find_messages([replies._text(user_message)])
+def _wake_keys(found, lineage) -> set:
+    """The keys of the keyed-queue wakes framed in this turn's prompt (*found*), for this lineage."""
+    return {row["note_key"] for row, _span in found
             if row.get("wake_admission") and row.get("requested") == record.QUEUE
             and row.get("note_key") and row.get("target_session_id") in lineage}
+
+
+def _deadline_wakes(found, lineage) -> set:
+    """The deadline notes whose wake line this turn's prompt (*found*) carries, for this lineage."""
+    return {row["id"] for row, _span in found
+            if row.get("wake_admission") and row.get("requested") == record.PASSIVE
+            and row.get("wake_at") is not None and row.get("target_session_id") in lineage}
 
 
 def _owner_instance():

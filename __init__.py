@@ -51,6 +51,11 @@ _PASSIVE_NO_SEAM = dict(
              "legacy inbox, which cannot hold a note. Nothing was sent."),
 )
 
+# The ``within`` parameter text, also one line of the tool text.
+_WITHIN_SENTENCE = (
+    "within: for a passive note, wake the target after this many minutes (at least 5) if it has not run"
+)
+
 # The ``profile`` parameter text, also one line of the tool text.
 _PROFILE_SENTENCE = 'profile: another Hermes profile on this machine; reach its bot with to: "Bot Chat"'
 
@@ -119,6 +124,7 @@ def _tool_description(projects: bool, user_name: str = "the user") -> str:
         + INTERRUPT_SENTENCE
         + " An idle session starts a turn.",
         _PASSIVE_SENTENCE,
+        _WITHIN_SENTENCE + ".",
         _PROFILE_SENTENCE + ".",
         'Write only something new: no thanks, "got it", "agreed", restating, or "I\'ll look later". '
         "When you receive a message and have nothing new, answer [SILENT] (for an ask, reply with "
@@ -170,6 +176,11 @@ def _schema(projects: bool, user_name: str = "the user") -> dict:
                     "description": (
                         "For passive or queue. A newer message with the same key replaces a held one."
                     ),
+                },
+                "within": {
+                    "type": "integer",
+                    "minimum": 5,
+                    "description": _WITHIN_SENTENCE + ". For send.",
                 },
                 "profile": {
                     "type": "string",
@@ -258,6 +269,7 @@ def _owner_dispatch(args: dict, **kw) -> dict:
                 reply_mode=args["reply"] if "reply" in args else None,
                 key=args.get("key"),
                 profile=args.get("profile"),
+                within=args.get("within"),
             )
         except ValueError as exc:
             return {"ok": False, "error": "usage", "exit": 2, "message": str(exc)}
@@ -424,6 +436,10 @@ def register(ctx) -> None:
     from . import passive
 
     passive.register(ctx)
+    # The dispatcher-tick hook (on_kanban_dispatch_tick): deadlines on held notes.
+    from . import deadline
+
+    deadline.register(ctx)
     from . import cli as cli_mod
 
     cli_mod.register(ctx)
