@@ -583,7 +583,7 @@ class AddressTests(unittest.TestCase):
         calls = []
         listed = address.list_sessions(lister=_recording_lister(rows, live, calls))
         self.assertTrue(listed["ok"])
-        self.assertEqual(calls, [("stored", True), ("live", False)])
+        self.assertEqual(calls, [("stored", True), ("live", True)])
         found = [item["id"] for item in listed["sessions"]]
         self.assertEqual(len(found), 30)
         self.assertEqual(found[0], "local-closed")
@@ -754,6 +754,53 @@ class AddressTests(unittest.TestCase):
         self.assertEqual(item["last_active"], 5)
         self.assertEqual(item["state"], "running")
 
+    def test_list_keeps_live_sessions_missing_from_the_stored_page(self):
+        # The owner's stored list is one page of recent sessions; busy cron runs can push
+        # an older, still-open chat off it. The live list must still bring it in.
+        stored = [
+            {"id": "local-cron-new", "title": "Check-in", "source": "cron", "running": False, "last_active_at": 9},
+            {"id": "local-paged", "title": "Paged", "source": "cli", "running": False, "last_active_at": 8},
+        ]
+        live = [
+            {"id": "local-old-chat", "session_id": "local-old-chat", "title": "Old chat", "source": "tui",
+             "running": True, "last_active_at": 7, "workspace": ""},
+            {"id": "local-old-idle", "title": "Open idle", "source": "cli", "running": False},
+            {"id": "local-old-run", "title": "Build run", "source": "oneshot", "running": True},
+            {"id": "local-paged", "title": "Paged", "source": "cli", "running": True},
+        ]
+        listed = address.list_sessions(lister=_quiet_lister(stored, live))
+        by_id = {item["id"]: item for item in listed["sessions"]}
+        self.assertEqual(by_id["local-old-chat"]["state"], "running")
+        self.assertEqual(by_id["local-old-chat"]["title"], "Old chat")
+        self.assertEqual(by_id["local-old-chat"]["source"], "tui")
+        self.assertEqual(by_id["local-old-idle"]["state"], "idle")
+        self.assertEqual(by_id["local-paged"]["state"], "running")
+        self.assertNotIn("local-old-run", by_id)
+        self.assertNotIn("local-cron-new", by_id)
+        self.assertEqual([item["id"] for item in listed["sessions"]].count("local-paged"), 1)
+        # With its last activity from the live row, it sorts by recency and survives the limit.
+        top = address.list_sessions(limit=2, lister=_quiet_lister(stored, live))
+        self.assertEqual([item["id"] for item in top["sessions"]], ["local-paged", "local-old-chat"])
+        with_runs = address.list_sessions(include_runs=True, lister=_quiet_lister(stored, live))
+        run_ids = {item["id"]: item["state"] for item in with_runs["sessions"]}
+        self.assertEqual(run_ids["local-old-run"], "running")
+        self.assertIn("local-cron-new", run_ids)
+
+    def test_list_keeps_a_running_live_only_chat_past_the_default_limit(self):
+        stored = [
+            {"id": f"local-stored-{index:02d}", "title": f"Stored {index}", "source": "cli",
+             "running": False, "last_active_at": float(index), "workspace": ""}
+            for index in range(40)
+        ]
+        # Shaped like the owner's live picker row: last_active_at comes from picker fields.
+        live = [{"session_id": "local-busy", "id": "local-busy", "title": "Busy", "source": "tui",
+                 "started_at": 1.0, "message_count": 9, "model": "m", "running": True,
+                 "last_active_at": 50.0, "workspace": ""}]
+        listed = address.list_sessions(lister=_quiet_lister(stored, live))
+        self.assertEqual(len(listed["sessions"]), 30)
+        self.assertEqual(listed["sessions"][0]["id"], "local-busy")
+        self.assertEqual(listed["sessions"][0]["state"], "running")
+
     def test_default_lister_calls_client_list_sessions(self):
         import client
 
@@ -766,7 +813,7 @@ class AddressTests(unittest.TestCase):
         with mock.patch.object(client, "list_sessions", fake):
             result = address.list_sessions()
         self.assertEqual(result, {"ok": True, "sessions": []})
-        self.assertEqual(seen, [("stored", True), ("live", False)])
+        self.assertEqual(seen, [("stored", True), ("live", True)])
 
     def test_live_tip_matches_a_stored_root(self):
         self.open_writer()
