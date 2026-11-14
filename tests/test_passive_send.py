@@ -68,7 +68,8 @@ class FakeCtx:
 class FakeOwner:
     def __init__(self):
         self.calls = []
-        self.answer = {"ok": True, "applied": "queue", "applied_detail": None, "admission_id": "adm-1"}
+        self.answer = {"ok": True, "applied": "queue", "applied_detail": None, "admission_id": "adm-1",
+                       "instance_id": "inst-1"}
 
     def __call__(self, target, text, delivery, submission_id):
         self.calls.append({"target": target, "delivery": delivery})
@@ -88,6 +89,9 @@ class PassiveTestBase(unittest.TestCase):
         patch = mock.patch.object(route.client, "deliver_sync", self.owner)
         patch.start()
         self.addCleanup(patch.stop)
+        instance = mock.patch.object(route.client, "owner_instance", return_value="inst-1")
+        instance.start()
+        self.addCleanup(instance.stop)
         from hermes_state import SessionDB
 
         self.db = SessionDB()
@@ -205,16 +209,17 @@ class UsageErrorTests(PassiveTestBase):
         self.assertEqual(self.rows(), [])
         self.assertEqual(self.owner.calls, [])
 
-    def test_key_with_queue_is_plain_queue_with_the_key_recorded(self):
+    def test_key_with_queue_keeps_the_newest_and_queues_one_wake(self):
         receipt = self.send(delivery="queue", key="build-state")
         self.assertTrue(receipt["ok"], receipt)
         self.assertEqual(len(self.owner.calls), 1)
         self.assertEqual(self.owner.calls[0]["delivery"], "queue")
         second = self.send(delivery="queue", key="build-state", message="build state: landed")
         self.assertTrue(second["ok"])
+        self.assertEqual(len(self.owner.calls), 1)  # it rides the queued wake (tests/test_keyed_queue.py)
         rows = self.rows()
         self.assertEqual([r["note_key"] for r in rows], ["build-state", "build-state"])
-        self.assertEqual([r["result"] for r in rows], ["held", "held"])
+        self.assertEqual([r["result"] for r in rows], ["replaced", "pending"])
         self.assertEqual([r["requested"] for r in rows], ["queue", "queue"])
 
     def test_an_unknown_delivery_is_still_a_value_error(self):
@@ -415,17 +420,15 @@ class ReplacementTests(PassiveTestBase):
         queued = self.send(delivery="queue", key="build-state")
         by_id = {r["id"]: r for r in self.rows()}
         self.assertEqual(by_id[passive["message_id"]]["result"], "pending")
-        self.assertEqual(by_id[queued["message_id"]]["result"], "held")
-        # A pending row of another mode with the key is left alone too.
-        record.insert_note("q0000001", kind="send", sender_label="cli", sender_source="script",
-                           address="Reviewer", body="queued", reply_mode="none", requested="queue",
-                           target_session_id="local-target", note_key="build-state",
-                           lineage=["local-target"])
+        self.assertEqual(by_id[queued["message_id"]]["result"], "pending")
+        # The pending queued row with the key is left alone by a passive one, and back.
         newer = self.send(key="build-state")
+        newer_queued = self.send(delivery="queue", key="build-state")
         by_id = {r["id"]: r for r in self.rows()}
-        self.assertEqual(by_id["q0000001"]["result"], "pending")
         self.assertEqual(by_id[passive["message_id"]]["result"], "replaced")
         self.assertEqual(by_id[newer["message_id"]]["result"], "pending")
+        self.assertEqual(by_id[queued["message_id"]]["result"], "replaced")
+        self.assertEqual(by_id[newer_queued["message_id"]]["result"], "pending")
 
     def test_other_targets_and_all_are_separate(self):
         mine = self.send(key="k")
@@ -605,7 +608,7 @@ class LogTests(PassiveTestBase):
         self.assertEqual(code, 0)
         [item] = json.loads(out)
         self.assertEqual(item["id"], queued["message_id"])
-        self.assertEqual(item["delivery"], "queued · key build-state")
+        self.assertEqual(item["delivery"], "queue: queued (replaceable) · key build-state")
 
 
 class ToolTests(unittest.TestCase):

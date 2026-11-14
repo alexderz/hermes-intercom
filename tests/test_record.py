@@ -27,7 +27,7 @@ COLUMNS = (
     "reply_mode", "requested", "applied", "applied_detail",
     "result", "detail", "reply", "reply_state",
     "created_at", "delivered_at", "replied_at", "echoed_at",
-    "note_key", "offered_turn", "sender_profile",
+    "note_key", "offered_turn", "sender_profile", "wake_admission", "wake_instance",
 )
 
 REPLY_CHECK = "CHECK (reply_mode IN ('none','requested','waiting','optional'))"

@@ -13,7 +13,8 @@ from the target's own turn, by a hook that runs for that turn and sees the messa
 
 Both hooks read only the user rows after the newest assistant row, enough to find a ``📡`` span
 and check its hash (``replies.find_messages``, the reply hook's span finder). Nothing from the turn is kept or logged.
-A message is echoed only when the row's ``target_chat_scope`` is ``private``. The post is claimed
+A message is echoed only when the row's ``target_chat_scope`` is ``private``; a row with a wake
+marker (a keyed queued message's wake line) never is: ``passive.py`` echoes its newest version. The post is claimed
 once (``record.claim_echo``), so retries and later requests never post twice. The text is escaped
 for the platform's renderer (``frame.escape_echo``); a platform missing from
 ``frame.ECHO_ESCAPERS`` gets no post and one warning: unescaped text could ping or format in that chat. The hook schedules
@@ -88,7 +89,8 @@ def _echo(texts, platform) -> None:
         if not any("📡" in text for text in texts):
             return
         for row, span in replies.find_messages(texts):
-            if row.get("target_chat_scope") != scope.PRIVATE:
+            # A keyed-queue wake line is never posted; its newest version is echoed at handover.
+            if row.get("wake_admission") or row.get("target_chat_scope") != scope.PRIVATE:
                 continue
             if not record.claim_echo(row["id"]):
                 continue

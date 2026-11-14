@@ -12,6 +12,15 @@ hand it over:
   confirms the offer (``record.confirm_notes``), and echoes each per-target note into a private
   chat once (``record.claim_echo``). ``all`` notes are never echoed.
 
+A keyed queued message (``route.send(delivery="queue", key=...)``) is a ``pending`` row whose
+send queued a framed wake line in Hermes's queue, or rides one already queued. The wake's turn
+carries the newest version: ``on_pre_llm_call`` finds the wake span in ``user_message`` with the
+reply hook's span finder and offers the newest pending row for that key, framed as live mail
+(the turn exists for it). Outside its wake turn such a row is offered only when its wake is no
+longer outstanding: a turn was already offered it, or its marker names another owner instance
+(the owner restarted and Hermes's in-memory queue went with it). Then it rides as a held note.
+The owner's instance id is discovered once per process.
+
 A turn that makes no model request (vetoed, or a runtime that does not carry plugin text) leaves
 its notes held; the next turn offers them again. Once the first request is built the notes are
 in the saved user message, so a later failure still counts them delivered. A steer starts no
@@ -44,6 +53,9 @@ _ctx = {"ctx": None}
 _lock = threading.Lock()
 _offered: dict[str, str] = {}
 
+# The owner instance this process runs in, discovered once (``client.owner_instance``).
+_instance: dict[str, str | None] = {"id": None}
+
 
 def register(ctx) -> None:
     """Keep *ctx* for settings and the echo, and register both hooks."""
@@ -52,7 +64,7 @@ def register(ctx) -> None:
     ctx.register_hook("pre_api_request", on_pre_api_request)
 
 
-def on_pre_llm_call(session_id=None, turn_id=None, **_kw):
+def on_pre_llm_call(session_id=None, turn_id=None, user_message=None, **_kw):
     """Offer this turn its held notes. Returns ``{"context": <frame>}``, or None when none."""
     if not _usable(session_id) or not _usable(turn_id):
         return None
@@ -61,13 +73,21 @@ def on_pre_llm_call(session_id=None, turn_id=None, **_kw):
             return None
         lineage, root = _lineage_and_root(session_id)
         facts = route._facts(session_id)
+        keys = _wake_keys(user_message, lineage)
         notes = record.offer_notes(turn_id, lineage=sorted(lineage), root_id=root,
-                                   include_all=facts["source"] not in address.RUN_SOURCES)
+                                   include_all=facts["source"] not in address.RUN_SOURCES,
+                                   wake_keys=sorted(keys), instance_id=_owner_instance())
         if not notes:
             return None
         ctx = _ctx["ctx"]
-        text = frame.held_notes(notes, replies._user_name(ctx),
-                                shared_line=_shared_line(notes, session_id, facts, ctx))
+        woken = [n for n in notes if n["requested"] == record.QUEUE and n["note_key"] in keys]
+        woken_ids = {n["id"] for n in woken}
+        held = [n for n in notes if n["id"] not in woken_ids]
+        parts = [route.frame_stored(n, ctx) for n in woken]
+        if held:
+            parts.append(frame.held_notes(held, replies._user_name(ctx),
+                                          shared_line=_shared_line(held, session_id, facts, ctx)))
+        text = "\n\n".join(parts)
         # Registered only once the frame exists: a turn is never confirmed for notes it did not get.
         with _lock:
             # An earlier turn of this lineage that never made a request no longer counts.
@@ -100,6 +120,20 @@ def on_pre_api_request(session_id=None, turn_id=None, platform=None, **_kw) -> N
 
 def _usable(value) -> bool:
     return isinstance(value, str) and value != ""
+
+
+def _wake_keys(user_message, lineage) -> set:
+    """The keys of the keyed-queue wakes framed in this turn's prompt, for this lineage."""
+    return {row["note_key"] for row, _span in replies.find_messages([replies._text(user_message)])
+            if row.get("wake_admission") and row.get("requested") == record.QUEUE
+            and row.get("note_key") and row.get("target_session_id") in lineage}
+
+
+def _owner_instance():
+    """The owner's instance id, discovered once per process; None (every marker dead) until found."""
+    if _instance["id"] is None:
+        _instance["id"] = route.client.owner_instance()
+    return _instance["id"]
 
 
 def _lineage_and_root(session_id: str) -> tuple[set, str]:

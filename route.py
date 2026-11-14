@@ -16,7 +16,13 @@
   be ``true``, read fresh from the profile config, else ``injection-off``;
 - 4 ``record.insert`` before delivery. A passive note stops here: ``record.insert_note``
   stores it ``pending`` (replacing the held note with its key and mode in the target's
-  lineage, or the pending ``all`` row) and the receipt is ``held``; nothing is delivered;
+  lineage, or the pending ``all`` row) and the receipt is ``held``; nothing is delivered.
+  A keyed queued message is stored ``pending`` too (``record.insert_keyed_queue``); it rides
+  the outstanding wake of the row it replaces, else its send frames a wake line
+  (``reply_mode='none'``, ``header_sha`` on its row) and queues it through steps 5-6. The
+  target's next turn carries the newest version (``passive.py``). Receipt: ``started`` (idle
+  target) or ``queued`` (replaceable, with the key); ``held`` when the owner did not take the
+  wake, so the row rides the target's next turn;
 - 5 ``frame.build``, ``sanitize_user_prompt_text`` once, then ``header_sha`` over the span from
   header line 1 to the closing line, stored in the row;
 - 6 ``client.deliver_sync``;
@@ -162,7 +168,6 @@ def send(sender, to, message, *, ctx, delivery="steer", reply_mode=None, kind="s
         return _refuse(receipt, row, "own-session", f"{NOTHING_SENT} {OWN_SESSION_REASON}")
 
     # 2. scopes
-    target_facts = _facts(target)
     target_scope = scope.chat_scope(target, ctx)
     sender_scope = None if script else scope.chat_scope(sender, ctx)
     receipt.shared_chat = target_scope == scope.SHARED
@@ -175,22 +180,17 @@ def send(sender, to, message, *, ctx, delivery="steer", reply_mode=None, kind="s
     # 4. the row before delivery; a passive note is held here
     if passive:
         return _hold(receipt, row, who, lineage=_target_lineage(target))
+    if delivery == "queue" and key:
+        return _queue_keyed(receipt, row, who, ctx=ctx, lister=lister,
+                            scopes=(sender_scope, target, target_scope, title))
     record.insert(**row)
     if on_inserted is not None:
         on_inserted(message_id, target)
 
     # 5. frame, sanitise once, hash the span
-    user_name = ctx.get_config("user_name", default=None) or DEFAULT_USER_NAME
-    text, _echo = frame.build(
-        message_id, who.frame_sender(), body, reply_mode=reply_mode,
-        requested_interrupt=delivery == "interrupt", kind=kind, reply_to=reply_to,
-        user_name=user_name,
-        sender_scope=None if script else frame.Scope(sender_scope, who.platform, who.chat_type, who.title),
-        target_scope=frame.Scope(target_scope, target_facts["platform"], target_facts["chat_type"], title),
-    )
-    from hermes_cli.input_sanitize import sanitize_user_prompt_text
-
-    text = sanitize_user_prompt_text(text)
+    text = _framed(message_id, who, body, ctx=ctx, reply_mode=reply_mode,
+                   interrupt=delivery == "interrupt", kind=kind, reply_to=reply_to,
+                   scopes=(sender_scope, target, target_scope, title))
     record.update(message_id, header_sha=header_sha(text, message_id))
 
     # 6. deliver through the owner
@@ -213,6 +213,21 @@ def send(sender, to, message, *, ctx, delivery="steer", reply_mode=None, kind="s
     detail = outcome.get("error") or "delivery-unknown"
     record.update(message_id, delivery_path="owner", result="error", detail=detail)
     return receipt.error(detail, _error_sentence(detail, outcome.get("code"), title, message_id))
+
+
+def frame_stored(row: dict, ctx) -> str:
+    """The live frame of a stored row, as its send would have framed it (sanitised).
+
+    For a keyed queued message handed over in its wake's turn: that turn exists for it.
+    """
+    if row.get("sender_source") == SCRIPT_SOURCE or not row.get("sender_session_id"):
+        who = _Who.script(row.get("sender_label"))
+    else:
+        who = _Who.session(row["sender_session_id"])
+    sender_scope = None if who.kind == "script" else row.get("sender_chat_scope")
+    return _framed(row["id"], who, row.get("body") or "", ctx=ctx, reply_mode=row["reply_mode"],
+                   scopes=(sender_scope, row.get("target_session_id"), row.get("target_chat_scope"),
+                           row.get("target_title") or row.get("target_session_id")))
 
 
 def injection_allowed() -> bool:
@@ -255,6 +270,70 @@ def _usage_error(delivery, key, to_all, reply_mode, kind) -> str | None:
     if passive and reply_mode == "waiting":
         return PASSIVE_WAITING
     return None
+
+
+def _framed(message_id, who, body, *, ctx, reply_mode, scopes, interrupt=False, kind="send",
+            reply_to=None) -> str:
+    """Step 5's frame, sanitised once. *scopes* is (sender scope, target, target scope, title)."""
+    sender_scope, target, target_scope, title = scopes
+    target_facts = _facts(target)
+    user_name = ctx.get_config("user_name", default=None) or DEFAULT_USER_NAME
+    text, _echo = frame.build(
+        message_id, who.frame_sender(), body, reply_mode=reply_mode,
+        requested_interrupt=interrupt, kind=kind, reply_to=reply_to, user_name=user_name,
+        sender_scope=None if who.kind == "script" else frame.Scope(sender_scope, who.platform,
+                                                                    who.chat_type, who.title),
+        target_scope=frame.Scope(target_scope, target_facts["platform"], target_facts["chat_type"], title),
+    )
+    from hermes_cli.input_sanitize import sanitize_user_prompt_text
+
+    return sanitize_user_prompt_text(text)
+
+
+def _queue_keyed(receipt, row, who, *, ctx, lister, scopes) -> dict:
+    """A keyed queued message: stored ``pending``; it rides an outstanding wake or queues one."""
+    message_id = row.pop("message_id")
+    _sender_scope, target, _target_scope, title = scopes
+    key = row["note_key"]
+    wake = client.submission_id(message_id)
+    replaced, submit = record.insert_keyed_queue(
+        message_id, lineage=_target_lineage(target), wake_admission=wake,
+        instance_id=client.owner_instance(), **row)
+    queued = (f'"{title}" is busy. Message {message_id} is queued (replaceable, key {key}): a newer '
+              "message with this key replaces it until its turn starts.")
+    result, applied = "queued", "queue"
+    if not submit:
+        sentence = f"{queued} It rides the wake already queued there."
+    else:
+        line = f"keyed update `{key}` from `{who.label}`; the current version follows."
+        text = _framed(message_id, who, line, ctx=ctx, reply_mode="none", scopes=scopes)
+        record.update(message_id, header_sha=header_sha(text, message_id))
+        was_open = _is_live(target, lister)
+        outcome = client.deliver_sync(target, text, "queue", wake)
+        if outcome.get("ok") is True:
+            applied = outcome.get("applied")
+            record.update(message_id, delivery_path="owner", admission_id=outcome.get("admission_id"),
+                          applied=applied, applied_detail=outcome.get("applied_detail"))
+            record.wake_submitted(wake, outcome.get("instance_id"))
+            if applied == "queue":
+                sentence = queued
+            else:
+                result = "started"
+                sentence = _delivered_sentence(applied, None, title, message_id, was_open)
+        else:
+            record.wake_failed(wake)
+            result, applied = "held", None
+            sentence = (f'Message {message_id} is held for "{title}" until its next turn: the gateway '
+                        f"did not take its wake ({outcome.get('error') or 'delivery-unknown'}).")
+    receipt.applied = applied
+    parts = [sentence]
+    if replaced:
+        parts.append(f"It replaces queued message {', '.join(replaced)} (key {key}).")
+    parts += [_answer_sentence(row["reply_mode"], who, message_id), _shared_sentence(receipt.shared_chat)]
+    fields = receipt.done(result, " ".join(part for part in parts if part))
+    fields["key"] = key
+    fields["replaced"] = replaced
+    return fields
 
 
 def _hold(receipt, row, who, *, lineage) -> dict:
