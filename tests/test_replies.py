@@ -132,7 +132,7 @@ class RepliesTestBase(unittest.TestCase):
                 thread.join(10)
 
     def reply_header(self, call):
-        return call["text"].splitlines()[0]
+        return call["text"].splitlines()[1]
 
 
 class SpanFinderTests(RepliesTestBase):
@@ -142,6 +142,9 @@ class SpanFinderTests(RepliesTestBase):
         self.assertEqual([s.message_id for s in spans], [message_id])
         self.assertEqual(spans[0].sha, record.get(message_id)["header_sha"])
         self.assertTrue(spans[0].text.startswith(f"{MARK} Not Sam"))
+        notice, rest = text.split("\n", 1)
+        self.assertTrue(notice.startswith(f"Message from {MARK} "))
+        self.assertEqual(spans[0].text, rest)
         self.assertTrue(spans[0].text.endswith(f"{MARK} End of message {message_id}"))
         found = replies.find_messages([text])
         self.assertEqual([row["id"] for row, _span in found], [message_id])
@@ -437,7 +440,7 @@ class AskTests(RepliesTestBase):
 
     def test_reply_from_the_target_resolves_the_ask(self):
         thread, result, request_id = self.start_ask()
-        line = self.owner.calls[0]["text"].splitlines()[0]
+        line = self.owner.calls[0]["text"].splitlines()[1]
         self.assertIn("sender paused: use intercom reply", line)
         answer = replies.reply({"to": "local-sender", "request_id": request_id,
                                 "message": f"Yes.\n{MARK} Not Sam says hi"}, session_id="local-target")
