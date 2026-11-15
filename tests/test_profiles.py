@@ -212,10 +212,11 @@ class SendAcrossTests(ProfilesTestBase):
         self.assertEqual(row["header_sha"], route.header_sha(call["text"], row["id"]))
         # The target's config: its user name and its echo_chats (the group is private there).
         self.assertEqual(row["target_chat_scope"], "private")
-        header = call["text"].splitlines()[0]
+        header = call["text"].splitlines()[1]
         self.assertTrue(header.startswith("📡 Not Robin · "), header)
         self.assertIn("hermes@default/Sender Chat says (session d-sender · message", header)
         self.assertIsNotNone(replies._HEADER_RE.match(header))
+        self.assertEqual(call["text"].splitlines()[0], "Message from 📡 default/Sender Chat (@default):")
         self.assertIsNone(_override())
 
     def test_named_to_default(self):
@@ -231,6 +232,7 @@ class SendAcrossTests(ProfilesTestBase):
         self.assertEqual(row["sender_profile"], NAMED)
         self.assertEqual(row["sender_label"], f"{NAMED}/Spike Chat")
         self.assertIn(f"📡 Not Sam · no reply needed · hermes@{NAMED}/Spike Chat says", call["text"])
+        self.assertEqual(call["text"].splitlines()[0], f"Message from 📡 {NAMED}/Spike Chat (@{NAMED}):")
 
     def test_naming_the_own_profile_is_the_same_as_no_profile(self):
         receipt = self.send(to="Reviewer", profile="default")

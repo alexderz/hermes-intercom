@@ -330,10 +330,14 @@ def injection_allowed() -> bool:
 
 
 def header_sha(text: str, message_id: str) -> str:
-    """SHA-256 of the framed span: header line 1 through ``📡 End of message <id>``."""
+    """SHA-256 of the framed span: header line 1 through ``📡 End of message <id>``.
+
+    The notice line before the header (``frame.NOTICE``) is not in the span.
+    """
     closing = f"📡 End of message {message_id}"
+    start = text.index("\n") + 1 if text.startswith(frame.NOTICE) else 0
     end = text.rindex(closing) + len(closing)
-    return hashlib.sha256(text[:end].encode("utf-8")).hexdigest()
+    return hashlib.sha256(text[start:end].encode("utf-8")).hexdigest()
 
 
 # ── internals ────────────────────────────────────────────────────────────────
@@ -545,9 +549,11 @@ def _end_with_session(message: str, session_id: str) -> str:
 class _Who:
     """The sender, for the record and the frame."""
 
-    def __init__(self, *, kind, label, source, session_id=None, title="", platform="", chat_type=""):
+    def __init__(self, *, kind, label, source, session_id=None, title="", platform="", chat_type="",
+                 profile=""):
         self.kind, self.label, self.source, self.session_id = kind, label, source, session_id
         self.title, self.platform, self.chat_type = title, platform, chat_type
+        self.profile = profile
 
     @classmethod
     def script(cls, label):
@@ -561,13 +567,14 @@ class _Who:
         kind = "session" if facts["local"] else "messaging"
         title = facts["title"] or session_id
         return cls(kind=kind, label=title, source=source, session_id=session_id, title=title,
-                   platform=facts["platform"], chat_type=facts["chat_type"])
+                   platform=facts["platform"], chat_type=facts["chat_type"],
+                   profile=profiles.current() or profiles.DEFAULT)
 
     def in_profile(self, profile):
         """This sender as another profile sees it: ``<profile>/<title>``."""
         label = frame.sanitize_title(f"{profile}/{self.title or self.label}")
         return _Who(kind=self.kind, label=label, source=self.source, session_id=self.session_id,
-                    title=label, platform=self.platform, chat_type=self.chat_type)
+                    title=label, platform=self.platform, chat_type=self.chat_type, profile=profile)
 
     @classmethod
     def of_profile(cls, session_id, profile, row):
@@ -579,13 +586,15 @@ class _Who:
             source = row.get("sender_source") or "unknown"
             label = frame.sanitize_title(row.get("sender_label"))
             return cls(kind="session" if source in scope.LOCAL_SOURCES else "messaging",
-                       label=label, source=source, session_id=session_id, title=label)
+                       label=label, source=source, session_id=session_id, title=label,
+                       profile=profile)
 
     def frame_sender(self):
         if self.kind == "script":
             return frame.Sender(kind="script", label=self.label)
         return frame.Sender(kind=self.kind, title=self.title, session_id=self.session_id,
-                            platform=self.platform, chat_type=self.chat_type, source=self.source)
+                            platform=self.platform, chat_type=self.chat_type, source=self.source,
+                            profile=self.profile)
 
 
 def _open_state():

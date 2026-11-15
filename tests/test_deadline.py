@@ -360,7 +360,7 @@ class SweepTests(DeadlineTestBase):
         self.assertEqual(wake["delivery"], "queue")
         self.assertIn("a held note from `status-script` is due; it follows.", wake["text"])
         self.assertNotIn("build state", wake["text"])
-        self.assertIn("no reply needed", wake["text"].splitlines()[0])
+        self.assertIn("no reply needed", wake["text"].splitlines()[1])
         row = record.get(receipt["message_id"])
         self.assertEqual(row["header_sha"], route.header_sha(wake["text"], receipt["message_id"]))
         self.assertEqual((row["wake_admission"], row["wake_instance"], row["admission_id"]),

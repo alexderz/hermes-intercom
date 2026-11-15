@@ -222,7 +222,7 @@ class WakeTests(KeyedQueueTestBase):
         wake = self.owner.wakes()[0]["text"]
         row = record.get(first["message_id"])
         self.assertEqual(row["header_sha"], route.header_sha(wake, first["message_id"]))
-        self.assertIn("no reply needed", wake.splitlines()[0])
+        self.assertIn("no reply needed", wake.splitlines()[1])
         self.assertEqual((row["wake_admission"], row["wake_instance"]),
                          (f"intercom-{first['message_id']}", "inst-1"))
         newer = record.get(second["message_id"])

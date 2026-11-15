@@ -151,8 +151,8 @@ class InputTests(RouteTestBase):
         row = self.rows()[0]
         self.assertEqual(row["reply_mode"], "optional")
         self.assertEqual(row["in_reply_to"], "abcd1234")
-        self.assertIn("reply optional", self.submitted().splitlines()[0])
-        self.assertIn("reply to your message abcd1234", self.submitted().splitlines()[0])
+        self.assertIn("reply optional", self.submitted().splitlines()[1])
+        self.assertIn("reply to your message abcd1234", self.submitted().splitlines()[1])
 
     def test_reply_mode_is_stored_and_echoed_as_passed(self):
         for mode in ("none", "requested", "waiting"):
@@ -244,7 +244,9 @@ class StepTests(RouteTestBase):
         text = self.submitted()
         closing = f"{MARK} End of message {receipt['message_id']}"
         self.assertTrue(text.endswith(closing))
-        self.assertEqual(row["header_sha"], hashlib.sha256(text.encode("utf-8")).hexdigest())
+        notice, span = text.split("\n", 1)
+        self.assertTrue(notice.startswith(f"Message from {MARK} "))
+        self.assertEqual(row["header_sha"], hashlib.sha256(span.encode("utf-8")).hexdigest())
         self.assertEqual(self.owner.calls[0]["submission_id"], f"intercom-{receipt['message_id']}")
 
     def test_submitted_text_is_sanitised(self):
@@ -311,9 +313,10 @@ class ConsentTests(RouteTestBase):
 class FramingTests(RouteTestBase):
     def test_cli_frames_as_a_script(self):
         receipt = self.send(sender="nightly", script=True)
-        first = self.submitted().splitlines()[0]
+        first = self.submitted().splitlines()[1]
         self.assertIn(f"hermes@script nightly says (message {receipt['message_id']}):", first)
         self.assertNotIn("session ", first)
+        self.assertEqual(self.submitted().splitlines()[0], f"Message from {MARK} nightly:")
         row = record.get(receipt["message_id"])
         self.assertIsNone(row["sender_session_id"])
         self.assertEqual(row["sender_source"], "script")
@@ -323,16 +326,17 @@ class FramingTests(RouteTestBase):
         # A script labelled like the target is still a script, never the target's own session.
         receipt = self.send(sender="local-target", script=True)
         self.assertTrue(receipt["ok"])
-        self.assertIn("hermes@script local-target says (message", self.submitted().splitlines()[0])
+        self.assertIn("hermes@script local-target says (message", self.submitted().splitlines()[1])
 
     def test_session_sender_header(self):
         receipt = self.send()
-        first = self.submitted().splitlines()[0]
+        first = self.submitted().splitlines()[1]
         self.assertIn(f"hermes@Sender Chat says (session local-sender · message {receipt['message_id']}):",
                       first)
         self.assertTrue(first.startswith(f"{MARK} Not Sam · no reply needed · "))
+        self.assertEqual(self.submitted().splitlines()[0], f"Message from {MARK} Sender Chat (@default):")
 
-    def test_every_submitted_text_starts_with_the_mark(self):
+    def test_every_submitted_text_starts_with_the_notice_then_the_mark(self):
         from hermes_cli.input_sanitize import sanitize_user_prompt_text
 
         self.add("tg-sender", "Phone", "telegram",
@@ -353,12 +357,14 @@ class FramingTests(RouteTestBase):
                 self.owner.calls.clear()
                 self.assertTrue(self.send(**variant)["ok"])
                 text = self.submitted()
-                self.assertTrue(text.startswith(MARK))
+                notice, header = text.split("\n", 2)[:2]
+                self.assertTrue(notice.startswith(f"Message from {MARK} "), notice)
+                self.assertTrue(header.startswith(MARK), header)
                 self.assertEqual(sanitize_user_prompt_text(text), text)
 
     def test_interrupt_is_framed_as_asked(self):
         self.send(delivery="interrupt")
-        self.assertIn("interrupt asked", self.submitted().splitlines()[0])
+        self.assertIn("interrupt asked", self.submitted().splitlines()[1])
         self.assertEqual(self.owner.calls[0]["delivery"], "interrupt")
 
 
