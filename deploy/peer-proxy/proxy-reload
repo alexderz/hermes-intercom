@@ -1,0 +1,132 @@
+#!/bin/sh
+# Render the agent-peer proxy config, validate it, and reload Caddy.
+# The config file is replaced only after the reload succeeds.
+# This hook never calls a CA helper.
+#
+# caddy validate and caddy reload honor XDG_CONFIG_HOME and XDG_DATA_HOME.
+# Set both when this process must leave any other Caddy state alone.
+#
+# Arguments are the same as render.py, plus --config-out <path>:
+#   --listen <addr:port>
+#   --server-name <name>
+#   --ca <ca.pem>
+#   --active <dir>
+#   --upstream <addr:port>
+#   --admin-socket <path>
+#   --cert <cert.pem> --key <key.pem>
+#     or --acme-dns <provider.json>
+#   --config-out <caddy.json>
+
+set -eu
+
+die() {
+  echo "proxy-reload: $*" >&2
+  exit 1
+}
+
+usage() {
+  echo "proxy-reload: $*" >&2
+  exit 2
+}
+
+listen=
+server_name=
+ca=
+active=
+upstream=
+admin_socket=
+config_out=
+cert=
+key=
+acme_dns=
+
+while [ $# -gt 0 ]; do
+  if [ $# -lt 2 ]; then
+    usage "missing value for $1"
+  fi
+  case $1 in
+    --listen) listen=$2 ;;
+    --server-name) server_name=$2 ;;
+    --ca) ca=$2 ;;
+    --active) active=$2 ;;
+    --upstream) upstream=$2 ;;
+    --admin-socket) admin_socket=$2 ;;
+    --config-out) config_out=$2 ;;
+    --cert) cert=$2 ;;
+    --key) key=$2 ;;
+    --acme-dns) acme_dns=$2 ;;
+    *) usage "unknown argument: $1" ;;
+  esac
+  shift 2
+done
+
+[ -n "$listen" ] || usage "--listen is required"
+[ -n "$server_name" ] || usage "--server-name is required"
+[ -n "$ca" ] || usage "--ca is required"
+[ -n "$active" ] || usage "--active is required"
+[ -n "$upstream" ] || usage "--upstream is required"
+[ -n "$admin_socket" ] || usage "--admin-socket is required"
+[ -n "$config_out" ] || usage "--config-out is required"
+
+if ! command -v caddy >/dev/null 2>&1; then
+  die "caddy not found on PATH"
+fi
+if ! command -v python3 >/dev/null 2>&1; then
+  die "python3 not found on PATH"
+fi
+
+hook=$0
+case $hook in
+  */*) ;;
+  *)
+    hook=$(command -v -- "$hook") || usage "cannot locate proxy-reload"
+    ;;
+esac
+dir=$(CDPATH= cd -- "$(dirname -- "$hook")" && pwd)
+render=$dir/render.py
+if [ ! -f "$render" ]; then
+  die "renderer not found next to proxy-reload"
+fi
+
+stage=$(mktemp -d "${TMPDIR:-/var/tmp}/peer-proxy-reload.XXXXXX")
+tmp=$stage/caddy.json
+cleanup() {
+  rm -rf "$stage"
+}
+trap cleanup EXIT
+
+set -- \
+  --listen "$listen" \
+  --server-name "$server_name" \
+  --ca "$ca" \
+  --active "$active" \
+  --upstream "$upstream" \
+  --admin-socket "$admin_socket"
+if [ -n "$cert" ]; then
+  set -- "$@" --cert "$cert"
+fi
+if [ -n "$key" ]; then
+  set -- "$@" --key "$key"
+fi
+if [ -n "$acme_dns" ]; then
+  set -- "$@" --acme-dns "$acme_dns"
+fi
+
+if ! python3 -I "$render" "$@" >"$tmp"; then
+  die "render failed; ${config_out} unchanged"
+fi
+
+if ! caddy validate --config "$tmp"; then
+  die "caddy validate failed; running config and ${config_out} unchanged"
+fi
+
+# --force is required. The leaf folder is read only at provision, and Caddy
+# skips a reload when the JSON is unchanged (a replaced pin under the same
+# name renders the same JSON).
+if ! caddy reload --force --config "$tmp" --address "unix/${admin_socket}"; then
+  die "caddy reload failed; running config and ${config_out} unchanged"
+fi
+
+if ! mv -f "$tmp" "$config_out"; then
+  die "reload succeeded but replacing ${config_out} failed"
+fi
