@@ -440,6 +440,11 @@ def register(ctx) -> None:
     from . import deadline
 
     deadline.register(ctx)
+    # The inbound platform for remote agents (intercom_peer): webhook posts into Bot Chat.
+    if getattr(ctx, "register_platform", None) is not None:
+        from . import peer_inbound
+
+        peer_inbound.register(ctx)
     from . import cli as cli_mod
 
     cli_mod.register(ctx)

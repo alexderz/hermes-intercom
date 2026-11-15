@@ -40,6 +40,10 @@ A deadline (``within``, passive.md P7): whole minutes, at least 5, on a per-targ
 only; anything else is a usage refusal. The row gets ``wake_at = created_at + within * 60``; the
 receipt says when it wakes. ``deadline.py`` fires it.
 
+A remote agent (``peer=<name>``, peers.md P1): the sender argument is None; the row has
+``sender_source='peer'``, ``sender_label=<name>`` and no sender session, and the script gates
+apply (no own-session check, no sender chat scope). Only ``peer_inbound`` sends this way.
+
 Refusals of steps 0-3 are recorded as ``delivery_path='refused'`` rows; ``reply-missing`` and the
 usage refusals are not.
 
@@ -73,6 +77,7 @@ PASSIVE = record.PASSIVE
 ALL = record.ALL
 DEFAULT_USER_NAME = "the user"
 SCRIPT_SOURCE = "script"
+PEER_SOURCE = "peer"
 
 # Readable receipt sentences (README, "The CLI"). Refusals not listed here use address's sentence.
 REPLY_MISSING = "Nothing was sent: choose reply: none, requested or waiting."
@@ -137,7 +142,7 @@ def cold_start_sentence(title: str, message_id: str) -> str:
 
 def send(sender, to, message, *, ctx, delivery="steer", reply_mode=None, kind="send",
          reply_to=None, script=False, lister=None, on_inserted=None, key=None,
-         profile=None, within=None) -> dict:
+         profile=None, within=None, peer=None) -> dict:
     """Send *message* from *sender* to the one session *to* resolves to. Returns the receipt.
 
     *sender* is the calling session's id, or with ``script=True`` a script label (the CLI, which
@@ -148,7 +153,8 @@ def send(sender, to, message, *, ctx, delivery="steer", reply_mode=None, kind="s
     ``passive`` or ``queue``) lets a newer message with the same key replace a held one.
     *profile* names another Hermes profile on this machine to deliver into. *within* (minutes,
     passive only) is the note's deadline: the sweep in ``deadline.py`` wakes the target then if
-    the note is still held.
+    the note is still held. *peer* names the remote agent a webhook post came from; *sender* is
+    then None.
     """
     passive = delivery == PASSIVE
     if not passive and delivery not in client.DELIVERIES:
@@ -174,7 +180,11 @@ def send(sender, to, message, *, ctx, delivery="steer", reply_mode=None, kind="s
     message_id = secrets.token_hex(4)
     receipt.message_id = message_id
     body = message if isinstance(message, str) else ""
-    who = _Who.script(sender) if script else _Who.session(sender)
+    if peer is not None:
+        sender, script = None, True
+        who = _Who.peer(peer)
+    else:
+        who = _Who.script(sender) if script else _Who.session(sender)
     row = dict(message_id=message_id, kind=kind, sender_label=who.label, sender_source=who.source,
                sender_session_id=who.session_id, address=to if isinstance(to, str) else "",
                body=body, reply_mode=reply_mode, requested=delivery, in_reply_to=reply_to,
@@ -302,13 +312,15 @@ def frame_stored(row: dict, ctx, *, body=None, reply_mode=None) -> str:
     For a keyed queued message handed over in its wake's turn: that turn exists for it. With
     *body* and *reply_mode*, another text framed as this row (a deadline note's wake line).
     """
-    if row.get("sender_source") == SCRIPT_SOURCE or not row.get("sender_session_id"):
+    if row.get("sender_source") == PEER_SOURCE:
+        who = _Who.peer(row.get("sender_label"))
+    elif row.get("sender_source") == SCRIPT_SOURCE or not row.get("sender_session_id"):
         who = _Who.script(row.get("sender_label"))
     elif row.get("sender_profile"):
         who = _Who.of_profile(row["sender_session_id"], row["sender_profile"], row)
     else:
         who = _Who.session(row["sender_session_id"])
-    sender_scope = None if who.kind == "script" else row.get("sender_chat_scope")
+    sender_scope = None if who.kind in ("script", "peer") else row.get("sender_chat_scope")
     text = (row.get("body") or "") if body is None else body
     return _framed(row["id"], who, text, ctx=ctx, reply_mode=reply_mode or row["reply_mode"],
                    scopes=(sender_scope, row.get("target_session_id"), row.get("target_chat_scope"),
@@ -404,7 +416,7 @@ def _framed(message_id, who, body, *, ctx, reply_mode, scopes, interrupt=False, 
     text, _echo = frame.build(
         message_id, who.frame_sender(), body, reply_mode=reply_mode,
         requested_interrupt=interrupt, kind=kind, reply_to=reply_to, user_name=user_name,
-        sender_scope=None if who.kind == "script" else frame.Scope(sender_scope, who.platform,
+        sender_scope=None if who.kind in ("script", "peer") else frame.Scope(sender_scope, who.platform,
                                                                     who.chat_type, who.title),
         target_scope=frame.Scope(target_scope, target_facts["platform"], target_facts["chat_type"], title),
     )
@@ -561,6 +573,12 @@ class _Who:
         return cls(kind="script", label=label, source=SCRIPT_SOURCE)
 
     @classmethod
+    def peer(cls, name):
+        """A remote agent: named by its ``peers.json`` name, with no session."""
+        label = frame.sanitize_title(name)
+        return cls(kind="peer", label=label, source=PEER_SOURCE)
+
+    @classmethod
     def session(cls, session_id):
         facts = _facts(session_id)
         source = facts["source"] or "unknown"
@@ -590,8 +608,8 @@ class _Who:
                        profile=profile)
 
     def frame_sender(self):
-        if self.kind == "script":
-            return frame.Sender(kind="script", label=self.label)
+        if self.kind in ("script", "peer"):
+            return frame.Sender(kind=self.kind, label=self.label)
         return frame.Sender(kind=self.kind, title=self.title, session_id=self.session_id,
                             platform=self.platform, chat_type=self.chat_type, source=self.source,
                             profile=self.profile)
@@ -715,6 +733,8 @@ def _answer_sentence(reply_mode, who, message_id) -> str:
         return "No answer was asked for, and none will come back."
     if reply_mode == "optional":
         return ""
+    if who.kind == "peer":
+        return "Only a reply block in its answer goes back to the remote agent."
     if who.kind == "script":
         return (f'Its answer will be stored in the record; read it with '
                 f'"hermes intercom status {message_id}".')

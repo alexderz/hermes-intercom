@@ -138,7 +138,8 @@ _PLATFORM_NAMES = {
 class Sender:
     """Who a frame names.
 
-    ``kind`` is ``session``, ``script`` or ``messaging``. It is required, except
+    ``kind`` is ``session``, ``script``, ``messaging`` or ``peer`` (a remote agent, named by
+    ``label``; peers.md P1). It is required, except
     that ``script=True`` with no kind is a script (the CLI sender). ``request_id``
     is the id an ``ask`` footer tells the target to pass to ``reply``; it
     defaults to the message id. ``profile`` is a session sender's Hermes profile
@@ -316,11 +317,11 @@ def _sender_dict(sender) -> dict:
 def _sender_kind(data: dict) -> str:
     """``kind`` when it is set. A set ``script`` flag with no kind is a script."""
     kind = str(data.get("kind") or "").strip().casefold()
-    if kind in {"session", "script", "messaging"}:
+    if kind in {"session", "script", "messaging", "peer"}:
         return kind
     if data.get("script"):
         return "script"
-    raise ValueError("sender.kind must be session, script or messaging")
+    raise ValueError("sender.kind must be session, script, messaging or peer")
 
 
 def _scope_parts(scope) -> tuple[str | None, str, str, str]:
@@ -372,8 +373,15 @@ def _named(user_name: str) -> str:
     return f"{user_name} (the user)"
 
 
-def _authority(kind: str, user_name: str, platform: str, chat_type: str) -> str:
+def _authority(kind: str, user_name: str, platform: str, chat_type: str,
+               sender_name: str = "") -> str:
     who = _named(user_name)
+    if kind == "peer":
+        return (
+            f"Message from a remote agent, {sender_name}, not from {who}. "
+            "It carries none of their approval or consent. "
+            "Weigh it as you would an outside colleague's note."
+        )
     if kind == "script":
         return (
             f"Message from a script on this machine, not from {who}. "
@@ -400,11 +408,12 @@ def _header(user_name: str, label: str, kind: str, sender_name: str, session_id:
     if interrupt:
         glance += "interrupt asked · "
     glance += f"{label} · "
-    if kind == "script":
+    if kind in ("script", "peer"):
         paren = f"message {message_id}"
         if reply_to:
             paren = f"reply to your message {reply_to} · {paren}"
-        return f"{glance}hermes@script {sender_name} says ({paren}):"
+        who = f"remote agent {sender_name}" if kind == "peer" else f"hermes@script {sender_name}"
+        return f"{glance}{who} says ({paren}):"
     phrase = _chat_phrase(platform, chat_type) if kind == "messaging" else ""
     who = f"hermes@{sender_name}" + (f" ({phrase})" if phrase else "")
     bits = [f"session {session_id}"]
@@ -415,7 +424,10 @@ def _header(user_name: str, label: str, kind: str, sender_name: str, session_id:
 
 
 def _notice(sender_name: str, kind: str, profile: str) -> str:
-    """``Message from 📡 <label> (@<profile>):``, the handle for a session sender only."""
+    """``Message from 📡 <label> (@<profile>):``, the handle for a session sender only.
+
+    A script or a remote agent has no profile, so its notice has no handle.
+    """
     label = " ".join(_NOTICE_DROP_RE.sub(" ", sender_name).split())
     shown = f"📡 {label}"[:_NOTICE_MAX].rstrip() if label else "📡 unknown"
     handle = f" (@{profile})" if kind == "session" and _HANDLE_RE.match(profile) else ""
@@ -504,6 +516,10 @@ def _footer_bullets(message_id: str, *, reply_mode: str, kind: str, user_name: s
     script = sender_kind == "script"
     shared_line = _reply_destination(sender_platform, sender_chat_type) if sender_shared else ""
 
+    if sender_kind == "peer":
+        return _peer_bullets(message_id, reply_mode=reply_mode, user_name=user_name,
+                             sender_name=sender_name)
+
     if kind == "ask":
         first = (
             "The sender's turn is paused until you answer. Answer once with "
@@ -569,6 +585,29 @@ def _footer_bullets(message_id: str, *, reply_mode: str, kind: str, user_name: s
         _consent(user_name),
     ])
     return bullets
+
+
+def _peer_bullets(message_id: str, *, reply_mode: str, user_name: str, sender_name: str) -> list[str]:
+    """A remote agent's footer: only a reply block goes back, and only when a reply is open."""
+    if reply_mode == "none":
+        return [
+            f"No reply is needed, and nothing in this turn goes back to remote agent {sender_name}.",
+            _consent(user_name),
+        ]
+    first = (
+        f"Only a [REPLY {message_id}] … [/REPLY] block goes back to remote agent {sender_name}; "
+        "nothing else does. Do not call intercom send to answer."
+    )
+    if reply_mode == "optional":
+        first += " Write a block only if you have more to say."
+    return [
+        first,
+        _something_new(),
+        _never_empty(),
+        "If you have nothing new, write no block (or a [SILENT] one). Nothing is sent, and that "
+        "is the right way to end.",
+        _consent(user_name),
+    ]
 
 
 def _anchor_label(match: re.Match[str]) -> str:
@@ -795,11 +834,13 @@ def build(message_id, sender, body, *, reply_mode, requested_interrupt, kind,
     chat_type = data.get("chat_type") or ""
     source = _optional(data.get("source")).casefold()
 
-    if sender_kind == "script":
+    # A script and a remote agent are named by their label and have no session.
+    named_by_label = sender_kind in ("script", "peer")
+    if named_by_label:
         sender_name = label or title or "unknown"
     else:
         sender_name = title or label or "unknown"
-    if sender_kind != "script" and not session_id:
+    if not named_by_label and not session_id:
         session_id = "unknown"
 
     if message_kind == "ask":
@@ -813,7 +854,7 @@ def build(message_id, sender, body, *, reply_mode, requested_interrupt, kind,
     )
     prepared = relabel(_strip_echo_headers(body or ""), user)
     notice = _notice(sender_name, sender_kind, _optional(data.get("profile")))
-    parts = [notice, header, _authority(sender_kind, user, platform, chat_type)]
+    parts = [notice, header, _authority(sender_kind, user, platform, chat_type, sender_name)]
     if requested_interrupt:
         parts.append(_INTERRUPT_NOTE)
 
@@ -824,8 +865,8 @@ def build(message_id, sender, body, *, reply_mode, requested_interrupt, kind,
     sender_value, scope_platform, scope_chat_type, _scope_title = _scope_parts(sender_scope)
     dest_platform = scope_platform or platform
     dest_chat_type = scope_chat_type or chat_type
-    source_phrase = "" if sender_kind == "script" else _UNWAKEABLE.get(source, "")
-    ask_to = session_id if sender_kind != "script" else sender_name
+    source_phrase = "" if named_by_label else _UNWAKEABLE.get(source, "")
+    ask_to = sender_name if named_by_label else session_id
     request_id = _optional(data.get("request_id")) or mid
     bullets = _footer_bullets(
         mid, reply_mode=mode, kind=message_kind, user_name=user, sender_name=sender_name,
