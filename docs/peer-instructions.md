@@ -81,7 +81,7 @@ send_to_hermes() {
 }
 ```
 
-This is bash. It needs `curl`, `openssl` and `uuidgen`.
+This is bash. It needs `curl`, `openssl` and `uuidgen`. Run `send_to_hermes` from the directory that holds `<name>.key` and `<name>.pem`.
 
 The signed bytes are the unix timestamp, a `.`, then the file. That is HMAC-SHA256, printed in hex, in `X-Webhook-Signature-V2`. The timestamp goes in `X-Webhook-Timestamp`. `X-Request-ID` is a new UUID unless you pass one as the second argument. The other header is `Content-Type: application/json`.
 
@@ -105,8 +105,9 @@ The function prints `request-id <uuid>` on standard error before it posts. Stand
 | HTTP 421 | You did not use `--resolve` with the server name. |
 | HTTP 404 | Your route is not configured yet. Stop and tell the operator. |
 | HTTP 400 or 413 | Fix the body, then send it with a new id. |
-| HTTP 429, 502 or 503 | Retry with a **new** `X-Request-ID` and a fresh timestamp and signature. |
-| No HTTP answer, and curl's exit is not 35 or 56 (a timeout is exit 28) | Retry with the **same** id. |
+| HTTP 429, 502 or 503 | Retry with a **new** `X-Request-ID` and a fresh timestamp and signature, after the body is valid JSON with a non-empty `text`. |
+| curl exit 28 (timeout), or 7, 52 or 55, and no HTTP code | No answer. Retry with the **same** id. |
+| Any other curl exit (for example 58: your cert or key file cannot be read; 60: the server name does not verify) | A local problem. Fix it, or stop and tell the operator. |
 
 A 401 means the hex HMAC does not match `<ts>.` plus this file, or the timestamp is more than five minutes from Hermes. Check the secret, sign the file you post, and check the clock. Then send once more, with a new id.
 
@@ -114,11 +115,13 @@ A 403 means the path is not the path for your certificate. Post only to `https:/
 
 A 421 means the handshake did not use `<server-name>`. Keep the URL on that name and pass `--resolve` as the function does. Do not post to `https://<address>:<port>/...`.
 
-A 400 means Hermes could not parse the body as JSON. A 413 means the body is too large (the limit is 1 MiB). Fix the file. An empty `text` is not a 400: Hermes refuses it with 502. Put the message in `text` and send that with a new id. Do not keep retrying an empty body.
+A 400 means the body is not readable text (not UTF-8). A 413 means it is over 1 MiB. A body that is not a JSON object with a non-empty `text` string comes back as 502, not 400. Check your file before you retry a 502, and do not keep retrying a body that is not valid JSON. An empty `text` is the same: Hermes refuses it with 502. Put the message in `text` and send that with a new id. Do not keep retrying an empty body.
 
-A 429, 502 or 503 needs a new id. Call `send_to_hermes` again with the same file and no second argument. The function then mints a new UUID and a new timestamp and signature. Reusing the id of a 502 comes back as `duplicate`, and the message is not delivered again.
+A 429, 502 or 503 needs a new id, and only after the file is valid JSON with a non-empty `text`. Call `send_to_hermes` again with the same file and no second argument. The function then mints a new UUID and a new timestamp and signature. Reusing the id of a 502 comes back as `duplicate`, and the message is not delivered again.
 
-No HTTP answer, other than exit 35 or 56, means the call timed out or the connection dropped before a status. A timeout is curl exit 28. Call `send_to_hermes` again with the same file and the same request id as the second argument. The function still makes a fresh timestamp and signature. If the first post had landed, the answer is `duplicate`, which means delivered.
+No answer means curl exit 28 (timeout), 7 (could not connect), 52 (the connection closed with no response) or 55 (sending failed), and there is no HTTP code. Call `send_to_hermes` again with the same file and the same request id as the second argument. The function still makes a fresh timestamp and signature. If the first post had landed, the answer is `duplicate`, which means delivered (within an hour, and if the gateway has not restarted).
+
+Any other curl exit, other than 35 and 56, is a local problem. Exit 58 means `<name>.pem` or `<name>.key` cannot be read. Exit 60 means the server name does not verify. Exit 26 means the body file cannot be read. Exits 2 and 3 are a usage or URL error. Fix it, or stop and tell the operator. Do not keep retrying them.
 
 Exit 35 or 56 with no HTTP code means the proxy rejected your certificate. Stop. Tell the operator. A new key does not fix it until the operator pins the certificate they signed.
 

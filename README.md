@@ -426,7 +426,7 @@ In the double-quoted `prompt`, each `\n` is a newline. The rendered message is t
 | `name` | `^[a-z0-9-]{1,63}$`. The same string is the certificate subject `CN`, the route `peer-<name>` and the address `peer:<name>`. |
 | `url` | The peer's webhook. Only an `https://` URL is loaded. |
 | `auth` | `hmac-v2` or `url`. |
-| `secret_file` | For `hmac-v2`, the HMAC secret Hermes uses to sign its post. For `url`, the full `https://` URL; `url` is that URL with the secret part replaced by `…`, which is what list and receipts show. |
+| `secret_file` | Path to a file that holds: for `hmac-v2`, the HMAC secret Hermes signs its post with; for `url`, the full secret `https://` URL. For `url`, the `url` field is that URL with the secret part replaced by `…`, which is what list and receipts show. |
 
 TLS is always verified. A redirect is an error.
 
@@ -445,7 +445,7 @@ Adding a peer needs a gateway restart. Static routes are read when the gateway s
 
 Pins are named `<name>.pem`. Each one is that peer's client certificate, a top-level file in the proxy's active pin folder.
 
-`deploy/peer-proxy/` is vendored with the plugin but never imported. The host operator installs [`render.py`](deploy/peer-proxy/render.py), [`proxy-reload`](deploy/peer-proxy/proxy-reload), [`caddy-agent-peers.service`](deploy/peer-proxy/caddy-agent-peers.service) and [`trial.sh`](deploy/peer-proxy/trial.sh). What each file does is in [Remote agent peers: the proxy](#remote-agent-peers-the-proxy).
+`deploy/peer-proxy/` is vendored with the plugin but never imported. The host operator installs [`render.py`](deploy/peer-proxy/render.py), [`proxy-reload`](deploy/peer-proxy/proxy-reload) and [`caddy-agent-peers.service`](deploy/peer-proxy/caddy-agent-peers.service); [`trial.sh`](deploy/peer-proxy/trial.sh) checks them on loopback. What each file does is in [Remote agent peers: the proxy](#remote-agent-peers-the-proxy).
 
 ## Remote agent peers: the proxy
 
@@ -456,7 +456,7 @@ Remote agents post to Bot Chat through a separate Caddy proxy. The host operator
 - [`caddy-agent-peers.service`](deploy/peer-proxy/caddy-agent-peers.service) is the systemd unit template. It runs `caddy run --config <config-json>` as an unprivileged user. The admin socket is the one rendered into the JSON. Replace each placeholder before installing.
 - [`trial.sh`](deploy/peer-proxy/trial.sh) proves the TLS and routing rules on loopback with the installed `caddy`.
 
-Each pin is a top-level `<name>.pem` in the active folder. `<name>` matches `^[a-z0-9-]{1,63}$` and is the certificate subject `CN`. The proxy requires that client certificate and forwards only `/webhooks/peer-<name>` to the upstream. Any other request is 403.
+`<name>` matches `^[a-z0-9-]{1,63}$` and is the certificate subject `CN`. Pin file names are in [Remote agent peers](#remote-agent-peers). The proxy requires that client certificate and forwards only `/webhooks/peer-<name>` to the upstream. Any other request is 403.
 
 ## Development
 
