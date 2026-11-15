@@ -383,8 +383,69 @@ It waits up to five minutes for the owner, then queues one message to each recor
 
 - Sessions open in the admin dashboard are not addressable; the receipt says so (`not-addressable`).
 - `@project` addressing needs a projects plugin that keeps `projects.db` with an `owner_session_id` column, named in `project_plugin` and enabled. Without it `@…` is refused and the tool does not offer it.
-- Same machine only. A session in another profile on this machine is reached with `profile` (see [Other profiles](#other-profiles)). Cross-machine messaging is out of scope.
+- Same machine only, for sessions. A session in another profile on this machine is reached with `profile` (see [Other profiles](#other-profiles)). A bot on another machine is a remote agent peer (see [Remote agent peers](#remote-agent-peers)).
 - The plugin depends on Hermes internals listed under Requirements.
+
+## Remote agent peers
+
+A remote agent peer is Bot Chat to a remote bot. Webhooks go each way: the remote bot posts to Hermes, and Hermes posts to the remote bot's webhook. The remote bot's post comes through an mTLS proxy, which checks the client certificate and forwards it to the webhook receiver on loopback. The post is delivered into the default profile's Bot Chat. Bot Chat addresses the peer as `peer:<name>`.
+
+The text to paste into the remote agent is [`docs/peer-instructions.md`](docs/peer-instructions.md).
+
+In the default profile's `config.yaml`:
+
+- `platforms.webhook` is enabled and bound to loopback, `extra.host: 127.0.0.1`. Without that host the receiver binds every interface and the proxy's mTLS is skipped.
+- `platforms.intercom_peer` is enabled.
+- One static route per peer, named `peer-<name>`, with the settings below.
+- `plugin-data/intercom/peers.json` lists the peers. The plugin reads it and does not write it.
+
+```yaml
+platforms:
+  webhook:
+    enabled: true
+    extra:
+      host: 127.0.0.1
+      routes:
+        peer-<name>:
+          secret: "<secret>"
+          deliver: intercom_peer
+          deliver_only: true
+          prompt: "reply_to={reply_to}\nwants_reply={wants_reply}\n{text}"
+          deliver_extra:
+            chat_id: "<name>"
+  intercom_peer:
+    enabled: true
+```
+
+In the double-quoted `prompt`, each `\n` is a newline. The rendered message is three lines: `reply_to=…`, `wants_reply=…`, then the text. `deliver_extra.chat_id` is the peer's name as a literal. Do not put braces in it: a `{template}` is filled from the post. Leave `events`, `profile`, `mirror_to_session`, `skills` and `script` unset. The route `secret` is the `<secret>` in the remote agent's send function.
+
+`peers.json` is a JSON list, one object per peer:
+
+| field | what it holds |
+|---|---|
+| `name` | `^[a-z0-9-]{1,63}$`. The same string is the certificate subject `CN`, the route `peer-<name>` and the address `peer:<name>`. |
+| `url` | The peer's webhook. Only an `https://` URL is loaded. |
+| `auth` | `hmac-v2` or `url`. |
+| `secret_file` | For `hmac-v2`, the HMAC secret Hermes uses to sign its post. For `url`, the full `https://` URL; `url` is that URL with the secret part replaced by `…`, which is what list and receipts show. |
+
+TLS is always verified. A redirect is an error.
+
+```json
+[
+  {
+    "name": "<name>",
+    "url": "https://<peer-webhook>",
+    "auth": "hmac-v2",
+    "secret_file": "<secret-file>"
+  }
+]
+```
+
+Adding a peer needs a gateway restart. Static routes are read when the gateway starts. The hot-reloaded `webhook_subscriptions.json` is not used, because agents can write it.
+
+Pins are named `<name>.pem`. Each one is that peer's client certificate, a top-level file in the proxy's active pin folder.
+
+`deploy/peer-proxy/` is vendored with the plugin but never imported. The host operator installs [`render.py`](deploy/peer-proxy/render.py), [`proxy-reload`](deploy/peer-proxy/proxy-reload), [`caddy-agent-peers.service`](deploy/peer-proxy/caddy-agent-peers.service) and [`trial.sh`](deploy/peer-proxy/trial.sh). What each file does is in [Remote agent peers: the proxy](#remote-agent-peers-the-proxy).
 
 ## Remote agent peers: the proxy
 
