@@ -1,0 +1,32 @@
+# caddy-agent-peers.service
+#
+# Template for the agent-peer proxy. Replace every <placeholder> before
+# installing. The process runs as an unprivileged user. That user must be
+# able to read <config-json> and to create the socket at <admin-socket>.
+#
+# The rendered JSON sets the admin listener to unix/<admin-socket>
+# (persist_config off). Reload with proxy-reload, passing the same
+# arguments as render.py plus --config-out <config-json>. proxy-reload
+# validates, then runs caddy reload --force. A bare caddy reload skips an
+# unchanged config, and the leaf folder is read only when the config is
+# provisioned, so a replaced pin would stay trusted.
+#
+# <state-dir> is a directory this user owns. XDG_CONFIG_HOME and
+# XDG_DATA_HOME keep this process away from any other Caddy state.
+# Set the same variables when running proxy-reload.
+
+[Unit]
+Description=Caddy agent-peer proxy
+After=network.target
+
+[Service]
+Type=simple
+User=<user>
+Group=<group>
+Environment=XDG_CONFIG_HOME=<state-dir>
+Environment=XDG_DATA_HOME=<state-dir>
+ExecStart=<caddy> run --config <config-json>
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

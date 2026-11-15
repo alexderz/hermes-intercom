@@ -386,6 +386,17 @@ It waits up to five minutes for the owner, then queues one message to each recor
 - Same machine only. A session in another profile on this machine is reached with `profile` (see [Other profiles](#other-profiles)). Cross-machine messaging is out of scope.
 - The plugin depends on Hermes internals listed under Requirements.
 
+## Remote agent peers: the proxy
+
+Remote agents post to Bot Chat through a separate Caddy proxy. The host operator installs the assets in [`deploy/peer-proxy/`](deploy/peer-proxy/). The plugin does not import them.
+
+- [`render.py`](deploy/peer-proxy/render.py) writes the proxy's Caddy JSON from the active pin folder.
+- [`proxy-reload`](deploy/peer-proxy/proxy-reload) renders to a temporary file, validates it, reloads Caddy with `--force`, and only then replaces the config file.
+- [`caddy-agent-peers.service`](deploy/peer-proxy/caddy-agent-peers.service) is the systemd unit template. It runs `caddy run --config <config-json>` as an unprivileged user. The admin socket is the one rendered into the JSON. Replace each placeholder before installing.
+- [`trial.sh`](deploy/peer-proxy/trial.sh) proves the TLS and routing rules on loopback with the installed `caddy`.
+
+Each pin is a top-level `<name>.pem` in the active folder. `<name>` matches `^[a-z0-9-]{1,63}$` and is the certificate subject `CN`. The proxy requires that client certificate and forwards only `/webhooks/peer-<name>` to the upstream. Any other request is 403.
+
 ## Development
 
 ```bash
