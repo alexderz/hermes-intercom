@@ -59,6 +59,12 @@ _WITHIN_SENTENCE = (
 # The ``profile`` parameter text, also one line of the tool text.
 _PROFILE_SENTENCE = 'profile: another Hermes profile on this machine; reach its bot with to: "Bot Chat"'
 
+# One fixed clause. It does not change per session or per peer (the tool schema is cached).
+_PEER_CLAUSE = (
+    'to: "peer:<name>" sends to a remote agent. Only Bot Chat can, and list shows '
+    "configured peers to Bot Chat."
+)
+
 # One line in the tool text for passive delivery and keys.
 _PASSIVE_SENTENCE = (
     "passive: held until the target's next turn, never wakes it; "
@@ -116,6 +122,7 @@ def _tool_description(projects: bool, user_name: str = "the user") -> str:
     paragraphs = [
         lead,
         _TO_PARAGRAPH_ON if projects else _TO_PARAGRAPH_OFF,
+        _PEER_CLAUSE,
         "reply (required for send): none for a one-way note (nothing comes back); requested if you "
         "want an answer; waiting if they should answer first but your turn can go on (your call "
         "returns; the answer arrives as a new message).",
@@ -253,7 +260,8 @@ def _owner_dispatch(args: dict, **kw) -> dict:
                        limit=args["limit"] if "limit" in args else None)
         profile = profiles.other(args.get("profile"))
         if profile is None:
-            return address.list_sessions(sender=session_id, **listing)
+            result = address.list_sessions(sender=session_id, **listing)
+            return _with_peers(result, session_id)
         return _list_in_profile(profile, listing)
     if action == "send":
         from . import route
@@ -282,6 +290,20 @@ def _owner_dispatch(args: dict, **kw) -> dict:
 
         return replies.reply(args, session_id=session_id)
     return {"ok": False, "error": f"unknown action {action!r}"}
+
+
+def _with_peers(result: dict, session_id) -> dict:
+    """Add configured peers for the default profile's Bot Chat. Other callers do not see them."""
+    from . import peers
+
+    if not isinstance(result, dict) or result.get("ok") is not True:
+        return result
+    shown = peers.for_bot_chat(session_id)
+    if shown is None:
+        return result
+    result = dict(result)
+    result["peers"] = shown
+    return result
 
 
 def _list_in_profile(profile: str, listing: dict) -> dict:

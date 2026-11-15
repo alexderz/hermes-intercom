@@ -15,14 +15,16 @@
 4. the reply text by ``reply_mode``:
    - ``requested`` / ``waiting``: the ``[REPLY <id>]`` block, else the whole answer. A sender in
      a shared chat (or a ``NULL`` scope with a messaging source) gets the block only; with no
-     block, ``stored`` / ``shared-chat-no-block``;
+     block, ``stored`` / ``shared-chat-no-block``. A remote agent (``sender_source='peer'``) is
+     block only too: with no block, nothing is sent (``no-block``);
    - ``optional`` (the message was a reply) and every held note (``requested='passive'``, or a
      keyed queued message handed over outside its wake's turn): the block only; with no block,
      ``no-block``. A keyed queued message in its wake's turn takes the ``requested`` branch;
 5. silence: an empty or ``[SILENT]`` text (whole, first line or last line) is ``silent``;
 6. store, then deliver on a fresh thread through ``route.send(..., delivery="steer",
    reply_mode="optional", reply_to=id)``, into the row's ``sender_profile`` when it came from
-   another profile. ``cron``, ``subagent``, ``oneshot`` and script
+   another profile. A peer row is posted before the unwakeable check, to ``peer:<name>``
+   (``peers.send``), and only the block is posted. ``cron``, ``subagent``, ``oneshot`` and script
    senders are stored only: their run is over and nothing can wake it. Nothing retries;
 7. stopped and failed turns fire no hook, so nothing is sent for them.
 
@@ -183,8 +185,10 @@ def reply_for(row: dict, answer: str, *, held: bool | None = None) -> tuple[str,
         held = row.get("requested") == record.PASSIVE
     block = reply_block(answer, row["id"])
     if block is None:
-        # A held note rides a turn that exists for something else: block only.
-        if row["reply_mode"] == "optional" or held:
+        # A held note rides a turn that exists for something else: block only. A remote
+        # agent's row is block only too: Bot Chat's answer is for its user, and only the
+        # block goes back.
+        if row["reply_mode"] == "optional" or held or row.get("sender_source") == route.PEER_SOURCE:
             return "no-block", None, None
         if _shared_sender(row):
             return "stored", None, "shared-chat-no-block"
@@ -216,7 +220,9 @@ def _unwakeable(row: dict) -> bool:
 def _answer(row: dict, answer: str, session_id: str, *, held: bool | None = None) -> None:
     state, text, detail = reply_for(row, answer, held=held)
     now = time.time()
-    if state == "sent" and _unwakeable(row):
+    # A peer has no session to wake, but the block still goes to its webhook. That branch
+    # is before the unwakeable downgrade, which would otherwise store the reply and stop.
+    if row.get("sender_source") != route.PEER_SOURCE and state == "sent" and _unwakeable(row):
         state = "stored"
     fields = {"reply_state": state, "replied_at": now}
     if text is not None:
@@ -233,9 +239,14 @@ def _answer(row: dict, answer: str, session_id: str, *, held: bool | None = None
 
 def _deliver(row: dict, text: str, session_id: str) -> None:
     try:
-        receipt = route.send(session_id, row["sender_session_id"], text, ctx=_ctx["ctx"],
-                             delivery="steer", reply_mode="optional", reply_to=row["id"],
-                             profile=row.get("sender_profile"))
+        if row.get("sender_source") == route.PEER_SOURCE:
+            receipt = route.send(session_id, f"peer:{row.get('sender_label') or ''}", text,
+                                 ctx=_ctx["ctx"], delivery="steer", reply_mode="optional",
+                                 reply_to=row["id"])
+        else:
+            receipt = route.send(session_id, row["sender_session_id"], text, ctx=_ctx["ctx"],
+                                 delivery="steer", reply_mode="optional", reply_to=row["id"],
+                                 profile=row.get("sender_profile"))
     except Exception as exc:  # health: allow BLE001 -- log the type only; the reply text can be in the traceback
         logger.warning("intercom: reply to message %s failed (%s)", row["id"], type(exc).__name__)
         return

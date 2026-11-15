@@ -44,6 +44,10 @@ A remote agent (``peer=<name>``, peers.md P1): the sender argument is None; the 
 ``sender_source='peer'``, ``sender_label=<name>`` and no sender session, and the script gates
 apply (no own-session check, no sender chat scope). Only ``peer_inbound`` sends this way.
 
+An outbound remote agent (``to`` starts with ``peer:``, peers.md P2): after the reply-mode
+check, ``peers.send`` is the whole send. It refuses unless the sender is the default profile's
+Bot Chat, then POSTs. The session steps below do not run.
+
 Refusals of steps 0-3 are recorded as ``delivery_path='refused'`` rows; ``reply-missing`` and the
 usage refusals are not.
 
@@ -154,7 +158,8 @@ def send(sender, to, message, *, ctx, delivery="steer", reply_mode=None, kind="s
     *profile* names another Hermes profile on this machine to deliver into. *within* (minutes,
     passive only) is the note's deadline: the sweep in ``deadline.py`` wakes the target then if
     the note is still held. *peer* names the remote agent a webhook post came from; *sender* is
-    then None.
+    then None. A ``to`` of ``peer:<name>`` is an outbound post to that remote agent
+    (``peers.send``); it is decided after the reply-mode check and does not resolve a session.
     """
     passive = delivery == PASSIVE
     if not passive and delivery not in client.DELIVERIES:
@@ -166,6 +171,17 @@ def send(sender, to, message, *, ctx, delivery="steer", reply_mode=None, kind="s
     receipt = _Receipt(to=to, requested=delivery, reply=reply_mode)
     if not (reply_mode in REPLY_MODES or (reply_mode == "optional" and reply_to)):
         return receipt.refused("reply-missing", REPLY_MISSING, reply=None)
+    # Remote agent. peers.send refuses on its own and records nothing when it does; the
+    # session steps below never see a peer: address.
+    peer_to = to.strip() if isinstance(to, str) else ""
+    if peer_to.startswith("peer:"):
+        try:
+            from . import peers
+        except ImportError:  # loaded as top-level modules (the unittest layout)
+            import peers
+        return peers.send(sender, peer_to, message, delivery=delivery, reply_mode=reply_mode,
+                          kind=kind, reply_to=reply_to, script=script, key=key, profile=profile,
+                          within=within)
     profile = profiles.other(profile)
     usage = _usage_error(delivery, key, to_all, reply_mode, kind, profile=profile, to=to,
                          within=within)
