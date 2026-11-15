@@ -44,7 +44,9 @@ AUTH_MODES = ("url", "hmac-v2")
 NAME_RE = re.compile(r"^[a-z0-9-]{1,63}$")
 PREFIX = "peer:"
 FROM = "hermes"
-# Fixed. A timeout is not a retry and not a cap.
+# Fixed. urllib applies this to each blocking socket call, not the whole request,
+# so a peer that sends a byte now and then can hold the thread longer. A timeout
+# is not a retry and not a cap.
 TIMEOUT_SECONDS = 30
 ONLY_BOT_CHAT = "only Bot Chat talks to remote agents; message Bot Chat"
 WAITING = "a remote agent cannot hold your turn; use requested"
@@ -111,17 +113,13 @@ def send(sender, to, message, *, delivery="steer", reply_mode=None, kind="send",
     """
     text = to.strip() if isinstance(to, str) else ""
     reply_to = reply_to or None
-    reason = _refusal(sender, text, delivery=delivery, kind=kind, script=script, key=key,
-                      profile=profile, within=within)
+    reason, peer = _refusal(sender, text, delivery=delivery, kind=kind, script=script, key=key,
+                            profile=profile, within=within)
     if reason is not None:
         return _refused(text, delivery, reply_mode, reason, ONLY_BOT_CHAT)
     if reply_mode == "waiting":
         return _refused(text, delivery, reply_mode, "waiting", WAITING)
 
-    name = text[len(PREFIX):]
-    peer = load().get(name)
-    if peer is None:
-        return _refused(text, delivery, reply_mode, "unknown-peer", ONLY_BOT_CHAT)
     body = message if isinstance(message, str) else ""
     wants_reply = reply_mode == "requested"
     if not body.strip():
@@ -169,8 +167,12 @@ def _is_https(url) -> bool:
     return parts.scheme == "https" and bool(parts.hostname)
 
 
-def _refusal(sender, to, *, delivery, kind, script, key, profile, within) -> str | None:
-    """The reason a send does not reach a peer, or None. Nothing is recorded for any of these."""
+def _refusal(sender, to, *, delivery, kind, script, key, profile, within) -> tuple[str | None, Peer | None]:
+    """``(reason, None)`` when the send stops here, else ``(None, peer)``.
+
+    Nothing is recorded for a reason. The peer comes from this one ``load()``, so the
+    send does not read ``peers.json`` again.
+    """
     try:
         from . import profiles, record
     except ImportError:  # loaded as top-level modules (the unittest layout)
@@ -178,25 +180,28 @@ def _refusal(sender, to, *, delivery, kind, script, key, profile, within) -> str
         import record
 
     if profiles.current() != profiles.DEFAULT:
-        return "not-default"
+        return "not-default", None
     if isinstance(profile, str) and profile.strip():
-        return "profile"
+        return "profile", None
     if script:
-        return "script"
+        return "script", None
     if kind == "ask":
-        return "ask"
+        return "ask", None
     if delivery == record.PASSIVE:
-        return "passive"
+        return "passive", None
     if key:
-        return "key"
+        return "key", None
     if within is not None:
-        return "within"
+        return "within", None
     if not _is_bot_chat(sender):
-        return "not-bot-chat"
+        return "not-bot-chat", None
     name = to[len(PREFIX):] if to.startswith(PREFIX) else ""
-    if not NAME_RE.match(name) or name not in load():
-        return "unknown-peer"
-    return None
+    if not NAME_RE.match(name):
+        return "unknown-peer", None
+    peer = load().get(name)
+    if peer is None:
+        return "unknown-peer", None
+    return None, peer
 
 
 def _on_default_profile() -> bool:
@@ -256,11 +261,7 @@ def _empty(sender, peer: Peer, body: str, *, delivery, reply_mode, reply_to) -> 
         import route
 
     message_id = secrets.token_hex(4)
-    who = _who(sender)
-    record.insert(message_id, kind="send", sender_label=who.label, sender_source=who.source,
-                  sender_session_id=who.session_id, address=f"{PREFIX}{peer.name}", body=body,
-                  reply_mode=reply_mode, requested=delivery, target_title=peer.name,
-                  in_reply_to=reply_to)
+    _record(sender, peer, message_id, body, delivery=delivery, reply_mode=reply_mode, reply_to=reply_to)
     record.update(message_id, delivery_path="refused", result="refused", detail="empty")
     fields = _fields(ok=False, receipt="refused", to=f"{PREFIX}{peer.name}", message_id=message_id,
                      title=peer.name, delivery=delivery, reply_mode=reply_mode,
@@ -283,7 +284,8 @@ def _target(peer: Peer):
     if peer.auth == "url":
         url = secret if _is_https(secret) else ""
         return (url, None) if url else None
-    return (peer.url.strip(), secret) if _is_https(peer.url) else None
+    # load() already dropped a peer whose url is not https.
+    return peer.url.strip(), secret
 
 
 def _payload(message_id: str, text: str, *, wants_reply: bool, reply_to) -> bytes:
@@ -352,7 +354,8 @@ def _exchange(url: str, data: bytes, headers: dict) -> tuple[int | None, str | N
     """POST *data* to *url*. ``(status, None)`` or ``(None, problem)``.
 
     TLS is the default context, so verification stays on. No proxy: the URL can carry the
-    secret. The secret is not interpolated into anything this function logs or returns.
+    secret. Any failure is the exception type (or ``delivery-unknown``); ``str(exc)`` is
+    never used, because it can contain the secret URL.
     """
     if not _is_https(url):
         return None, "not-https"
@@ -371,7 +374,7 @@ def _exchange(url: str, data: bytes, headers: dict) -> tuple[int | None, str | N
         status = exc.code
         try:
             exc.read()
-        except OSError:
+        except Exception:  # health: allow BLE001 -- a short body must not replace the HTTP code
             pass
         finally:
             exc.close()
@@ -379,6 +382,8 @@ def _exchange(url: str, data: bytes, headers: dict) -> tuple[int | None, str | N
     except (TimeoutError, urllib.error.URLError, ssl.SSLError, OSError) as exc:
         if _timed_out(exc):
             return None, "delivery-unknown"
+        return None, type(exc).__name__
+    except Exception as exc:  # health: allow BLE001 -- type name only; str(exc) can quote the secret URL
         return None, type(exc).__name__
 
 

@@ -68,13 +68,35 @@ class _Handler(BaseHTTPRequestHandler):
                 server.seen.append(item)
             if server.delay:
                 time.sleep(server.delay)
-            self._respond()
+            # hmac-v2 posts the bare hook. A bad or missing signature is 401; url-auth
+            # posts the secret in the path and carries no signature.
+            if method == "POST" and self.path == "/hook" and not self._hmac_ok(body):
+                self._respond(401)
+            else:
+                self._respond()
         finally:
             with server.lock:
                 server.inflight -= 1
 
-    def _respond(self):
-        status = self.server.status
+    def _hmac_ok(self, body):
+        stamp = self.headers.get("X-Webhook-Timestamp")
+        signature = self.headers.get("X-Webhook-Signature-V2")
+        if not stamp or not signature:
+            return False
+        expected = hmac.new(HMAC_SECRET.encode("utf-8"), stamp.encode("utf-8") + b"." + body,
+                            hashlib.sha256).hexdigest()
+        return hmac.compare_digest(expected, signature)
+
+    def _respond(self, status=None):
+        if status is None and self.server.raw_response is not None:
+            self.close_connection = True
+            try:
+                self.wfile.write(self.server.raw_response)
+                self.wfile.flush()
+            except OSError:
+                return
+            return
+        status = self.server.status if status is None else status
         try:
             self.send_response(status)
             if 300 <= status < 400:
@@ -106,6 +128,7 @@ class _Server(ThreadingHTTPServer):
         self.ssl_context = context
         self.delay = 0
         self.status = 200
+        self.raw_response = None
         self.location = ""
         self.seen = []
         self.inflight = 0
@@ -334,12 +357,16 @@ class OutboundTestBase(unittest.TestCase):
         self.write_peers([self.peer(PEER)])
         self.ctx = FakeCtx(user_name="Sam")
         self.log = _Log()
-        logger = logging.getLogger("peers")
-        logger.addHandler(self.log)
-        self.addCleanup(logger.removeHandler, self.log)
+        root = logging.getLogger()
+        previous_level = root.level
+        root.setLevel(logging.DEBUG)
+        root.addHandler(self.log)
+        self.addCleanup(root.setLevel, previous_level)
+        self.addCleanup(root.removeHandler, self.log)
         self.server.home = self.home
         self.server.delay = 0
         self.server.status = 200
+        self.server.raw_response = None
         self.server.seen.clear()
         ctx_patch = mock.patch.dict(replies._ctx, {"ctx": self.ctx})
         ctx_patch.start()
@@ -401,6 +428,12 @@ class OutboundTestBase(unittest.TestCase):
             text += "\n" + json.dumps(row, default=str)
         for secret in (HMAC_SECRET, URL_SECRET):
             self.assertNotIn(secret, text)
+
+    @staticmethod
+    def _drop_module(name):
+        for key in list(sys.modules):
+            if key == name or key.startswith(name + "."):
+                sys.modules.pop(key, None)
 
     def assert_refused(self, receipt, error, message=ONLY_BOT_CHAT):
         self.assertFalse(receipt["ok"], receipt)
@@ -779,6 +812,60 @@ class PostTests(OutboundTestBase):
         self.assertNotIn(URL_SECRET, row["detail"])
         self.assert_clean(receipt)
 
+    def test_a_spaced_secret_url_is_an_error_and_stays_out_of_tool_output(self):
+        token = "s3cret tok"
+        self.url_file.write_text(f"{self.hook_url}/{token}\n", encoding="utf-8")
+        shown = f"{self.hook_url}/\u2026"
+        self.write_peers([self.peer(PEER, auth="url", url=shown)])
+        name = f"hermes_intercom_out_{self._testMethodName}"
+        plugin = _load_plugin(name)
+        self.addCleanup(self._drop_module, name)
+        ctx = FakeCtx(user_name="Sam")
+        with mock.patch.object(plugin.inbox, "start", side_effect=AssertionError("inbox")):
+            plugin.register(ctx)
+        raw = plugin.handle(
+            {"action": "send", "to": f"peer:{PEER}", "message": "hi", "reply": "none"},
+            session_id=BOT)
+        self.assertNotIn(token, raw)
+        receipt = json.loads(raw)
+        self.assertFalse(receipt["ok"], receipt)
+        self.assertEqual(receipt["error"], "InvalidURL")
+        self.assertEqual(receipt["message"], "not delivered (InvalidURL)")
+        row = record.get(receipt["message_id"])
+        self.assertEqual(row["result"], "error")
+        self.assertEqual(row["detail"], "InvalidURL")
+        self.assertNotIn(token, row["detail"])
+        self.assertEqual(self.server.seen, [])
+        self.assertNotIn(token, "\n".join(self.log.lines))
+        self.assert_clean(receipt, raw)
+
+    def test_a_malformed_status_line_records_the_error_type(self):
+        self.server.raw_response = b"NOT A STATUS LINE\r\n"
+        receipt = self.send("weird")
+        self.assertFalse(receipt["ok"], receipt)
+        self.assertEqual(receipt["error"], "BadStatusLine")
+        self.assertEqual(receipt["message"], "not delivered (BadStatusLine)")
+        self.assertNotIn("NOT A STATUS", json.dumps(receipt))
+        row = record.get(receipt["message_id"])
+        self.assertEqual(row["result"], "error")
+        self.assertEqual(row["detail"], "BadStatusLine")
+        self.assertEqual(len(self.server.seen), 1)
+        self.assert_clean(receipt)
+
+    def test_the_fake_server_rejects_a_bad_hmac(self):
+        wrong = "not-the-server-secret"
+        self.hmac_file.write_text(wrong + "\n", encoding="utf-8")
+        receipt = self.send("bad sig")
+        self.assertEqual(receipt["error"], "HTTP 401")
+        self.assertEqual(receipt["message"], "not delivered (HTTP 401)")
+        self.assertEqual([item["path"] for item in self.server.seen], ["/hook"])
+        self.assertNotIn(wrong, json.dumps(receipt))
+        self.assertNotIn(wrong, "\n".join(self.log.lines))
+        row = record.get(receipt["message_id"])
+        self.assertEqual(row["result"], "error")
+        self.assertEqual(row["detail"], "HTTP 401")
+        self.assert_clean(receipt)
+
     def test_the_post_runs_on_the_calling_thread(self):
         box = {}
         real = peers._exchange
@@ -906,12 +993,6 @@ class SchemaListTests(OutboundTestBase):
         plugin = _load_plugin(name)
         self.addCleanup(self._drop_module, name)
         return plugin
-
-    @staticmethod
-    def _drop_module(name):
-        for key in list(sys.modules):
-            if key == name or key.startswith(name + "."):
-                sys.modules.pop(key, None)
 
     def test_the_peer_clause_is_fixed_and_names_no_peer(self):
         plugin = self.load_plugin()
