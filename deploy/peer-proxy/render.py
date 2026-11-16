@@ -5,6 +5,10 @@ Stdlib only. One route per top-level ``<name>.pem`` whose stem matches
 ``^[a-z0-9-]{1,63}$``. Other top-level ``*.pem`` names are skipped with a
 warning: the leaf folder loader still trusts them at TLS, and they have no
 route, so those clients get 403.
+
+``--access-log`` is required. The access log is JSON and rolls. A failed
+handshake never becomes a request, so it is not an access line: Caddy's
+TLS logger writes it to ``<path>.tls``.
 """
 
 from __future__ import annotations
@@ -18,6 +22,9 @@ from pathlib import Path
 # Peer name, certificate CN, pin file stem and route name are the same string.
 PEER_NAME = re.compile(r"^[a-z0-9-]{1,63}$")
 SUBJECT = "{http.request.tls.client.subject}"
+CLIENT_SERIAL = "{http.request.tls.client.serial}"
+# Suffix on the server access logger, so the file receives this server only.
+ACCESS_LOGGER = "agent-peers"
 
 
 def _die(message: str) -> None:
@@ -57,6 +64,19 @@ def peer_names(active: str) -> list[str]:
     return names
 
 
+def _log_fields() -> list[dict]:
+    """Fields the access log does not include on its own.
+
+    The stock line has remote address, path and status, plus the client
+    common name and serial under ``request.tls``. The route matches the
+    full subject, so the line carries that string too.
+    """
+    return [
+        {"handler": "log_append", "key": "client_subject", "value": SUBJECT},
+        {"handler": "log_append", "key": "client_serial", "value": CLIENT_SERIAL},
+    ]
+
+
 def _peer_route(name: str, upstream: str) -> dict:
     path = f"/webhooks/peer-{name}"
     # Matchers in one object are AND. The expression uses the full
@@ -64,6 +84,7 @@ def _peer_route(name: str, upstream: str) -> dict:
     # expanded in JSON, so it never matches.
     return {
         "handle": [
+            *_log_fields(),
             {"handler": "rewrite", "uri": path},
             {
                 "handler": "reverse_proxy",
@@ -133,6 +154,39 @@ def _certificate_source(
     }
 
 
+def _file_writer(path: str) -> dict:
+    # roll is on by default when the field is omitted. Set it so the
+    # rendered file states the choice.
+    return {"filename": path, "output": "file", "roll": True}
+
+
+def _logging(access_log: str) -> dict:
+    """Access lines in ``access_log``. Handshake failures in ``<path>.tls``.
+
+    Those failures are debug lines on ``http.stdlib`` (the message is
+    ``TLS handshake error``) and ``tls.handshake``. They are not HTTP
+    requests, so the access log never sees them. The default logger drops
+    the access lines; the file is where they are kept.
+    """
+    access_logger = "http.log.access." + ACCESS_LOGGER
+    return {
+        "logs": {
+            "access": {
+                "encoder": {"format": "json"},
+                "include": [access_logger],
+                "writer": _file_writer(access_log),
+            },
+            "default": {"exclude": [access_logger]},
+            "tls": {
+                "encoder": {"format": "json"},
+                "include": ["http.stdlib", "tls.handshake"],
+                "level": "DEBUG",
+                "writer": _file_writer(access_log + ".tls"),
+            },
+        }
+    }
+
+
 def render_config(
     *,
     listen: str,
@@ -141,6 +195,7 @@ def render_config(
     active: str,
     upstream: str,
     admin_socket: str,
+    access_log: str,
     cert: str | None = None,
     key: str | None = None,
     acme_dns: str | None = None,
@@ -152,10 +207,16 @@ def render_config(
     active = _require_text(active, "--active")
     upstream = _require_text(upstream, "--upstream")
     admin_socket = _require_text(admin_socket, "--admin-socket")
+    access_log = _require_text(access_log, "--access-log")
 
     routes = [_peer_route(name, upstream) for name in peer_names(active)]
     routes.append(
-        {"handle": [{"handler": "static_response", "status_code": 403}]}
+        {
+            "handle": [
+                *_log_fields(),
+                {"handler": "static_response", "status_code": 403},
+            ]
+        }
     )
 
     # One policy, no match, so a different SNI cannot select a policy that
@@ -166,6 +227,7 @@ def render_config(
         "automatic_https": {"disable": True},
         "listen": [listen],
         "protocols": ["h1", "h2"],
+        "logs": {"default_logger_name": ACCESS_LOGGER},
         "routes": routes,
         "tls_connection_policies": [
             {
@@ -199,6 +261,7 @@ def render_config(
             "http": {"servers": {"agent-peers": server}},
             "tls": _certificate_source(server_name, cert, key, acme_dns),
         },
+        "logging": _logging(access_log),
     }
 
 
@@ -219,6 +282,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--active", required=True, help="directory of <name>.pem pins")
     parser.add_argument("--upstream", required=True, help="upstream dial address")
     parser.add_argument("--admin-socket", required=True, help="unix socket for the admin API")
+    parser.add_argument(
+        "--access-log",
+        required=True,
+        help="JSON access log path; handshake failures go to <path>.tls",
+    )
     parser.add_argument("--cert", help="server certificate PEM")
     parser.add_argument("--key", help="server private key PEM")
     parser.add_argument(
@@ -237,6 +305,7 @@ def main(argv: list[str] | None = None) -> int:
         active=args.active,
         upstream=args.upstream,
         admin_socket=args.admin_socket,
+        access_log=args.access_log,
         cert=args.cert,
         key=args.key,
         acme_dns=args.acme_dns,
