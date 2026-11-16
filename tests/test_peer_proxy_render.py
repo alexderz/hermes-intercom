@@ -141,6 +141,7 @@ class RenderTests(unittest.TestCase):
                         "value": render.CLIENT_SERIAL,
                     },
                     {"handler": "rewrite", "uri": path},
+                    {"handler": "request_body", "max_size": 65536},
                     {
                         "handler": "reverse_proxy",
                         "upstreams": [{"dial": "127.0.0.1:8644"}],
@@ -326,6 +327,176 @@ class RenderTests(unittest.TestCase):
         text = render.dump_config(config)
         self.assertIn('"roll": true', text)
         self.assertIn("peer-access.log.tls", text)
+
+    def main_argv(self, *extra):
+        return [
+            "--listen",
+            "127.0.0.1:8645",
+            "--server-name",
+            "agent-peers.example",
+            "--ca",
+            str(self.ca),
+            "--active",
+            str(self.active),
+            "--upstream",
+            "127.0.0.1:8644",
+            "--admin-socket",
+            self.sock,
+            "--access-log",
+            str(self.root / "access.log"),
+            "--cert",
+            str(self.cert),
+            "--key",
+            str(self.key),
+            *extra,
+        ]
+
+    def body_limits(self, text):
+        config = json.loads(text)
+        routes = config["apps"]["http"]["servers"]["agent-peers"]["routes"]
+        limits = {}
+        for route in routes:
+            found = [
+                handle["max_size"]
+                for handle in route["handle"]
+                if handle.get("handler") == "request_body"
+            ]
+            handlers = [handle["handler"] for handle in route["handle"]]
+            if "match" not in route:
+                self.assertEqual(found, [])
+                self.assertNotIn("request_body", handlers)
+                continue
+            self.assertEqual(len(found), 1)
+            self.assertLess(
+                handlers.index("request_body"),
+                handlers.index("reverse_proxy"),
+            )
+            limits[route["match"][0]["path"][0]] = found[0]
+        return limits
+
+    def test_max_body_and_per_peer_override(self):
+        self.write_pin("beta.pem")
+        self.write_pin("alpha.pem")
+        out = io.StringIO()
+        err = io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            self.assertEqual(render.main(self.main_argv()), 0)
+        self.assertEqual(err.getvalue(), "")
+        self.assertEqual(
+            self.body_limits(out.getvalue()),
+            {
+                "/webhooks/peer-alpha": 65536,
+                "/webhooks/peer-beta": 65536,
+            },
+        )
+        out = io.StringIO()
+        with redirect_stdout(out), redirect_stderr(io.StringIO()):
+            self.assertEqual(
+                render.main(
+                    self.main_argv(
+                        "--max-body",
+                        "100",
+                        "--max-body-peer",
+                        "beta=250",
+                        "--max-body-peer",
+                        "alpha=40",
+                    )
+                ),
+                0,
+            )
+        self.assertEqual(
+            self.body_limits(out.getvalue()),
+            {
+                "/webhooks/peer-alpha": 40,
+                "/webhooks/peer-beta": 250,
+            },
+        )
+        # A later value for the same peer replaces the earlier one.
+        out = io.StringIO()
+        with redirect_stdout(out), redirect_stderr(io.StringIO()):
+            self.assertEqual(
+                render.main(
+                    self.main_argv(
+                        "--max-body",
+                        "100",
+                        "--max-body-peer",
+                        "beta=10",
+                        "--max-body-peer",
+                        "beta=80",
+                    )
+                ),
+                0,
+            )
+        limits = self.body_limits(out.getvalue())
+        self.assertEqual(limits["/webhooks/peer-alpha"], 100)
+        self.assertEqual(limits["/webhooks/peer-beta"], 80)
+
+    def assert_render_error(self, extra, message):
+        out = io.StringIO()
+        with redirect_stdout(out), redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as ctx:
+                render.main(self.main_argv(*extra))
+        self.assertNotEqual(ctx.exception.code, 0)
+        self.assertIn(message, str(ctx.exception))
+        self.assertEqual(out.getvalue(), "")
+
+    def test_body_limit_rejects_bad_values(self):
+        self.write_pin("alpha.pem")
+        self.assert_render_error(["--max-body", "0"], "positive integer")
+        self.assert_render_error(["--max-body", "-5"], "positive integer")
+        self.assert_render_error(["--max-body", "12kb"], "positive integer")
+        self.assert_render_error(["--max-body", ""], "positive integer")
+        self.assert_render_error(["--max-body", "²"], "positive integer")
+        self.assert_render_error(["--max-body", "١٢"], "positive integer")
+        self.assert_render_error(
+            ["--max-body", "9223372036854775808"],
+            "positive integer",
+        )
+        self.assert_render_error(
+            ["--max-body-peer", "alpha=0"],
+            "positive integer",
+        )
+        self.assert_render_error(
+            ["--max-body-peer", "alpha=-1"],
+            "positive integer",
+        )
+        self.assert_render_error(
+            ["--max-body-peer", "alpha=nope"],
+            "positive integer",
+        )
+        self.assert_render_error(
+            ["--max-body-peer", "alpha"],
+            "<name>=<bytes>",
+        )
+        self.assert_render_error(
+            ["--max-body-peer", "=10"],
+            "<name>=<bytes>",
+        )
+        self.assert_render_error(
+            ["--max-body-peer", "beta=10"],
+            "--max-body-peer 'beta=10': unknown peer 'beta' "
+            "(no active pin; remove this argument)",
+        )
+        # The largest signed 64-bit byte count is accepted.
+        out = io.StringIO()
+        with redirect_stdout(out), redirect_stderr(io.StringIO()):
+            self.assertEqual(
+                render.main(self.main_argv("--max-body", "9223372036854775807")),
+                0,
+            )
+        self.assertEqual(
+            self.body_limits(out.getvalue())["/webhooks/peer-alpha"],
+            9223372036854775807,
+        )
+
+    def test_removed_pin_with_leftover_override(self):
+        pin = self.write_pin("beta.pem")
+        pin.unlink()
+        self.assert_render_error(
+            ["--max-body-peer", "beta=10"],
+            "--max-body-peer 'beta=10': unknown peer 'beta' "
+            "(no active pin; remove this argument)",
+        )
 
     def test_acme_dns_must_be_an_object(self):
         path = self.root / "dns.json"

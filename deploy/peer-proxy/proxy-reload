@@ -14,6 +14,8 @@
 #   --upstream <addr:port>
 #   --admin-socket <path>
 #   --access-log <path>
+#   --max-body <bytes>
+#   --max-body-peer <name>=<bytes>   (repeat for each peer)
 #   --cert <cert.pem> --key <key.pem>
 #     or --acme-dns <provider.json>
 #   --config-out <caddy.json>
@@ -41,6 +43,22 @@ config_out=
 cert=
 key=
 acme_dns=
+max_body=
+max_body_set=0
+# Peer overrides are stored one per line. sh has no arrays, and the
+# values are passed through unchanged so render.py can reject them.
+args_dir=$(mktemp -d "${TMPDIR:-/var/tmp}/peer-proxy-args.XXXXXX")
+peer_file=$args_dir/peers
+: >"$peer_file"
+stage=
+
+cleanup() {
+  if [ -n "${stage:-}" ]; then
+    rm -rf "$stage"
+  fi
+  rm -rf "$args_dir"
+}
+trap cleanup EXIT
 
 while [ $# -gt 0 ]; do
   if [ $# -lt 2 ]; then
@@ -58,6 +76,11 @@ while [ $# -gt 0 ]; do
     --cert) cert=$2 ;;
     --key) key=$2 ;;
     --acme-dns) acme_dns=$2 ;;
+    --max-body)
+      max_body_set=1
+      max_body=$2
+      ;;
+    --max-body-peer) printf '%s\n' "$2" >>"$peer_file" ;;
     *) usage "unknown argument: $1" ;;
   esac
   shift 2
@@ -94,10 +117,6 @@ fi
 
 stage=$(mktemp -d "${TMPDIR:-/var/tmp}/peer-proxy-reload.XXXXXX")
 tmp=$stage/caddy.json
-cleanup() {
-  rm -rf "$stage"
-}
-trap cleanup EXIT
 
 set -- \
   --listen "$listen" \
@@ -116,6 +135,12 @@ fi
 if [ -n "$acme_dns" ]; then
   set -- "$@" --acme-dns "$acme_dns"
 fi
+if [ "$max_body_set" -eq 1 ]; then
+  set -- "$@" --max-body "$max_body"
+fi
+while IFS= read -r item || [ -n "$item" ]; do
+  set -- "$@" --max-body-peer "$item"
+done <"$peer_file"
 
 if ! python3 -I "$render" "$@" >"$tmp"; then
   die "render failed; ${config_out} unchanged"
