@@ -13,6 +13,7 @@
 #   --active <dir>
 #   --upstream <addr:port>
 #   --admin-socket <path>
+#   --access-log <path>
 #   --cert <cert.pem> --key <key.pem>
 #     or --acme-dns <provider.json>
 #   --config-out <caddy.json>
@@ -35,6 +36,7 @@ ca=
 active=
 upstream=
 admin_socket=
+access_log=
 config_out=
 cert=
 key=
@@ -51,6 +53,7 @@ while [ $# -gt 0 ]; do
     --active) active=$2 ;;
     --upstream) upstream=$2 ;;
     --admin-socket) admin_socket=$2 ;;
+    --access-log) access_log=$2 ;;
     --config-out) config_out=$2 ;;
     --cert) cert=$2 ;;
     --key) key=$2 ;;
@@ -66,6 +69,7 @@ done
 [ -n "$active" ] || usage "--active is required"
 [ -n "$upstream" ] || usage "--upstream is required"
 [ -n "$admin_socket" ] || usage "--admin-socket is required"
+[ -n "$access_log" ] || usage "--access-log is required"
 [ -n "$config_out" ] || usage "--config-out is required"
 
 if ! command -v caddy >/dev/null 2>&1; then
@@ -101,7 +105,8 @@ set -- \
   --ca "$ca" \
   --active "$active" \
   --upstream "$upstream" \
-  --admin-socket "$admin_socket"
+  --admin-socket "$admin_socket" \
+  --access-log "$access_log"
 if [ -n "$cert" ]; then
   set -- "$@" --cert "$cert"
 fi

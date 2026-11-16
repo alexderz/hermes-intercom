@@ -60,6 +60,8 @@ upstream_port=
 ca=$work/ca.pem
 config=$work/caddy.json
 sock=$work/admin.sock
+access_log=$work/access.log
+tls_log=$work/access.log.tls
 
 ok() {
   printf 'PASS %s\n' "$1"
@@ -120,6 +122,7 @@ render_initial() {
     --active "$work/active" \
     --upstream "127.0.0.1:${upstream_port}" \
     --admin-socket "$sock" \
+    --access-log "$access_log" \
     --cert "$work/certs/server.pem" \
     --key "$work/keys/server.key" \
     >"$config"
@@ -133,6 +136,7 @@ run_hook() {
     --active "$work/active" \
     --upstream "127.0.0.1:${upstream_port}" \
     --admin-socket "$sock" \
+    --access-log "$access_log" \
     --cert "$work/certs/server.pem" \
     --key "$work/keys/server.key" \
     --config-out "$config" \
@@ -278,6 +282,76 @@ expect_refused() {
   bad "$label ($(tr '\n' ' ' <"$work/probe.txt"))"
 }
 
+# Poll a JSON log until python says the lines match. Caddy writes the
+# line as the request or handshake finishes; give it a moment.
+wait_log() {
+  local label=$1 file=$2
+  shift 2
+  if python3 -I - "$file" "$@" <<'PY'
+import json
+import sys
+import time
+
+def access_403(row):
+    request = row.get("request") or {}
+    uri = request.get("uri") or ""
+    remote = request.get("remote_ip") or ""
+    subject = row.get("client_subject") or ""
+    serial = row.get("client_serial") or ""
+    return (
+        row.get("status") == 403
+        and uri == "/webhooks/peer-beta"
+        and remote == "127.0.0.1"
+        and subject == "CN=alpha"
+        and serial != ""
+    )
+
+def handshake(row):
+    logger = row.get("logger") or ""
+    msg = (row.get("msg") or "").lower()
+    # A refused handshake is not an access line. Caddy records it as
+    # "TLS handshake error" on http.stdlib, with detail on tls.handshake.
+    if logger == "http.stdlib" and "tls handshake error" in msg:
+        return True
+    if logger == "tls.handshake" and any(
+        word in msg for word in ("fail", "error", "reject", "not trusted")
+    ):
+        return True
+    return False
+
+path = sys.argv[1]
+kind = sys.argv[2]
+offset = int(sys.argv[3]) if len(sys.argv) > 3 and sys.argv[3] != "" else 0
+deadline = time.time() + 5
+while time.time() < deadline:
+    try:
+        with open(path, "rb") as handle:
+            handle.seek(offset)
+            text = handle.read().decode("utf-8", "replace")
+    except OSError:
+        text = ""
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if kind == "403" and access_403(row):
+            sys.exit(0)
+        if kind == "handshake" and handshake(row):
+            sys.exit(0)
+    time.sleep(0.1)
+sys.exit(1)
+PY
+  then
+    ok "$label"
+    return
+  fi
+  bad "$label ($(tr '\n' ' ' <"$file" 2>/dev/null | tail -c 600))"
+}
+
 tcp_open() {
   python3 -I - "$port" <<'PY'
 import socket, sys
@@ -367,6 +441,7 @@ expect_status "other peer path 200 for that peer" "$beta_cert" "$beta_key" \
   "/webhooks/peer-beta" 200 "/webhooks/peer-beta"
 expect_status "other peer's path 403" "$alpha_cert" "$alpha_key" \
   "/webhooks/peer-beta" 403
+wait_log "other peer's path 403 logged" "$access_log" 403
 expect_status "/p/x/... 403" "$alpha_cert" "$alpha_key" "/p/x/y" 403
 
 expect_status "path trick case reaches own route" \
@@ -382,8 +457,13 @@ expect_status "path trick .. does not reach the other peer" \
   "$alpha_cert" "$alpha_key" "/webhooks/peer-alpha/../peer-beta" 403
 
 expect_refused "no client cert refused" "" "" own
+tls_mark=0
+if [ -f "$tls_log" ]; then
+  tls_mark=$(wc -c <"$tls_log" | tr -d ' ')
+fi
 expect_refused "unpinned cert from the same CA refused" \
   "$gamma_cert" "$gamma_key" own
+wait_log "unpinned cert handshake logged" "$tls_log" handshake "$tls_mark"
 expect_refused "wrong SNI refused at the handshake" \
   "$alpha_cert" "$alpha_key" wrong
 expect_refused "no SNI refused at the handshake" \

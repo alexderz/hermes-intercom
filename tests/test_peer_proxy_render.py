@@ -53,6 +53,7 @@ class RenderTests(unittest.TestCase):
             active=str(self.active),
             upstream="127.0.0.1:8644",
             admin_socket=self.sock,
+            access_log=str(self.root / "access.log"),
             cert=str(self.cert),
             key=str(self.key),
         )
@@ -129,6 +130,16 @@ class RenderTests(unittest.TestCase):
             self.assertEqual(
                 route["handle"],
                 [
+                    {
+                        "handler": "log_append",
+                        "key": "client_subject",
+                        "value": render.SUBJECT,
+                    },
+                    {
+                        "handler": "log_append",
+                        "key": "client_serial",
+                        "value": render.CLIENT_SERIAL,
+                    },
                     {"handler": "rewrite", "uri": path},
                     {
                         "handler": "reverse_proxy",
@@ -138,7 +149,21 @@ class RenderTests(unittest.TestCase):
             )
         self.assertEqual(
             routes[-1],
-            {"handle": [{"handler": "static_response", "status_code": 403}]},
+            {
+                "handle": [
+                    {
+                        "handler": "log_append",
+                        "key": "client_subject",
+                        "value": render.SUBJECT,
+                    },
+                    {
+                        "handler": "log_append",
+                        "key": "client_serial",
+                        "value": render.CLIENT_SERIAL,
+                    },
+                    {"handler": "static_response", "status_code": 403},
+                ]
+            },
         )
         self.assertNotIn("match", routes[-1])
         warning = err.getvalue()
@@ -167,7 +192,23 @@ class RenderTests(unittest.TestCase):
         )
         self.assertEqual(
             server["routes"],
-            [{"handle": [{"handler": "static_response", "status_code": 403}]}],
+            [
+                {
+                    "handle": [
+                        {
+                            "handler": "log_append",
+                            "key": "client_subject",
+                            "value": render.SUBJECT,
+                        },
+                        {
+                            "handler": "log_append",
+                            "key": "client_serial",
+                            "value": render.CLIENT_SERIAL,
+                        },
+                        {"handler": "static_response", "status_code": 403},
+                    ]
+                }
+            ],
         )
 
     def test_admin_socket_and_persist_off(self):
@@ -193,6 +234,8 @@ class RenderTests(unittest.TestCase):
             "127.0.0.1:8644",
             "--admin-socket",
             self.sock,
+            "--access-log",
+            str(self.root / "access.log"),
             "--cert",
             str(self.cert),
             "--key",
@@ -251,6 +294,38 @@ class RenderTests(unittest.TestCase):
         self.assertIn("--cert/--key or --acme-dns", str(no_source.exception))
         with self.assertRaises(SystemExit):
             self.config(key=None)
+
+    def test_access_log_is_required_and_names_the_tls_sibling(self):
+        with self.assertRaises(SystemExit) as missing:
+            self.config(access_log="")
+        self.assertIn("--access-log", str(missing.exception))
+        config = self.config(access_log="peer-access.log")
+        logs = config["logging"]["logs"]
+        access = logs["access"]
+        self.assertEqual(
+            access["writer"],
+            {"filename": "peer-access.log", "output": "file", "roll": True},
+        )
+        self.assertEqual(access["encoder"], {"format": "json"})
+        self.assertEqual(access["include"], ["http.log.access.agent-peers"])
+        self.assertNotIn("level", access)
+        tls = logs["tls"]
+        self.assertEqual(
+            tls["writer"],
+            {"filename": "peer-access.log.tls", "output": "file", "roll": True},
+        )
+        self.assertEqual(tls["encoder"], {"format": "json"})
+        self.assertEqual(tls["level"], "DEBUG")
+        self.assertEqual(tls["include"], ["http.stdlib", "tls.handshake"])
+        self.assertEqual(
+            logs["default"]["exclude"],
+            ["http.log.access.agent-peers"],
+        )
+        server = self.server(config)
+        self.assertEqual(server["logs"], {"default_logger_name": "agent-peers"})
+        text = render.dump_config(config)
+        self.assertIn('"roll": true', text)
+        self.assertIn("peer-access.log.tls", text)
 
     def test_acme_dns_must_be_an_object(self):
         path = self.root / "dns.json"

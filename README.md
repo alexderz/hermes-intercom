@@ -394,7 +394,7 @@ The text to paste into the remote agent is [`docs/peer-instructions.md`](docs/pe
 
 In the default profile's `config.yaml`:
 
-- `platforms.webhook` is enabled and bound to loopback, `extra.host: 127.0.0.1`. Without that host the receiver binds every interface and the proxy's mTLS is skipped.
+- `platforms.webhook` is enabled and bound to loopback, `extra.host: 127.0.0.1`. Without that host the receiver binds every interface and the proxy's mTLS is skipped. See [Remote agent peers: security notes](#remote-agent-peers-security-notes).
 - `platforms.intercom_peer` is enabled.
 - One static route per peer, named `peer-<name>`, with the settings below.
 - `plugin-data/intercom/peers.json` lists the peers. The plugin reads it and does not write it.
@@ -451,12 +451,24 @@ Pins are named `<name>.pem`. Each one is that peer's client certificate, a top-l
 
 Remote agents post to Bot Chat through a separate Caddy proxy. The host operator installs the assets in [`deploy/peer-proxy/`](deploy/peer-proxy/). The plugin does not import them.
 
-- [`render.py`](deploy/peer-proxy/render.py) writes the proxy's Caddy JSON from the active pin folder.
-- [`proxy-reload`](deploy/peer-proxy/proxy-reload) renders to a temporary file, validates it, reloads Caddy with `--force`, and only then replaces the config file.
+- [`render.py`](deploy/peer-proxy/render.py) writes the proxy's Caddy JSON from the active pin folder. `--access-log <path>` is required.
+- [`proxy-reload`](deploy/peer-proxy/proxy-reload) renders to a temporary file, validates it, reloads Caddy with `--force`, and only then replaces the config file. It takes the same arguments as `render.py`, plus `--config-out`. If the reload fails it exits non-zero, prints the reason, and leaves the running proxy and the config file unchanged.
 - [`caddy-agent-peers.service`](deploy/peer-proxy/caddy-agent-peers.service) is the systemd unit template. It runs `caddy run --config <config-json>` as an unprivileged user. The admin socket is the one rendered into the JSON. Replace each placeholder before installing.
 - [`trial.sh`](deploy/peer-proxy/trial.sh) proves the TLS and routing rules on loopback with the installed `caddy`.
 
 `<name>` matches `^[a-z0-9-]{1,63}$` and is the certificate subject `CN`. Pin file names are in [Remote agent peers](#remote-agent-peers). The proxy requires that client certificate and forwards only `/webhooks/peer-<name>` to the upstream. Any other request is 403.
+
+`--access-log <path>` is the JSON access log. The file rolls. Each line has the remote address, the TLS client subject, the client certificate serial, the path and the status. A handshake that fails never becomes a request, so it is not in that file. Caddy's TLS logger (`http.stdlib` and `tls.handshake`) writes it to the sibling `<path>.tls`, also JSON and also rolled. A 403 and a refused handshake are both kept.
+
+## Remote agent peers: security notes
+
+mTLS ends at the proxy. The proxy checks the client certificate and forwards the request in plaintext to 127.0.0.1:8644. Anything that can open that port and knows the route's secret can post straight to `/webhooks/peer-<name>` with no client certificate. A process running as the hermes user can. Root on the host is inside this trust boundary.
+
+Keep the receiver on loopback. In the config above, `platforms.webhook.extra.host` is `127.0.0.1`. Do not remove that key. With it unset, the receiver binds every interface and a post can skip the proxy. Do not set the key to any other address.
+
+Give each peer route its own secret. The file that holds the secret is mode 0600.
+
+To revoke a peer, remove its pin, then run `proxy-reload`. A certificate revocation list does not stop a client. The pin is what the proxy trusts. If the reload fails, `proxy-reload` exits non-zero and prints the reason, and the proxy keeps trusting the pins it already loaded until a reload succeeds.
 
 ## Development
 
