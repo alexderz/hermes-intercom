@@ -9,6 +9,11 @@ route, so those clients get 403.
 ``--access-log`` is required. The access log is JSON and rolls. A failed
 handshake never becomes a request, so it is not an access line: Caddy's
 TLS logger writes it to ``<path>.tls``.
+
+Each peer route limits the request body with the ``request_body`` handler
+(``max_size``) before ``reverse_proxy``. ``--max-body`` sets that limit
+for every peer. When the flag is absent the limit is 65536 bytes.
+``--max-body-peer <name>=<bytes>`` overrides it for one peer.
 """
 
 from __future__ import annotations
@@ -25,6 +30,10 @@ SUBJECT = "{http.request.tls.client.subject}"
 CLIENT_SERIAL = "{http.request.tls.client.serial}"
 # Suffix on the server access logger, so the file receives this server only.
 ACCESS_LOGGER = "agent-peers"
+# 64 KiB. Absent --max-body uses this on every peer route.
+DEFAULT_MAX_BODY = 65536
+# Caddy stores max_size as a signed 64-bit integer.
+_INT64_MAX = 2**63 - 1
 
 
 def _die(message: str) -> None:
@@ -77,15 +86,50 @@ def _log_fields() -> list[dict]:
     ]
 
 
-def _peer_route(name: str, upstream: str) -> dict:
+def _positive_bytes(value: object, label: str) -> int:
+    """Return a byte count Caddy can store, or exit with a clear error."""
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        _die(f"{label} must be a positive integer, not {value!r}")
+    shown: object = value
+    if isinstance(value, str):
+        if not value.isdigit():
+            _die(f"{label} must be a positive integer, not {value!r}")
+        number = int(value)
+    else:
+        number = value
+    if number < 1 or number > _INT64_MAX:
+        _die(f"{label} must be a positive integer, not {shown!r}")
+    return number
+
+
+def _peer_overrides(names: list[str], items: list[str] | None) -> dict[str, int]:
+    """Map peer name to a body limit. The last value for a name wins."""
+    overrides: dict[str, int] = {}
+    known = set(names)
+    for item in items or []:
+        if not isinstance(item, str):
+            _die(f"--max-body-peer must be <name>=<bytes>, not {item!r}")
+        name, sep, raw = item.partition("=")
+        if sep == "" or name == "" or raw == "":
+            _die(f"--max-body-peer must be <name>=<bytes>, not {item!r}")
+        if name not in known:
+            _die(f"--max-body-peer {item!r}: unknown peer {name!r}")
+        overrides[name] = _positive_bytes(raw, f"--max-body-peer {item!r}")
+    return overrides
+
+
+def _peer_route(name: str, upstream: str, max_body: int) -> dict:
     path = f"/webhooks/peer-{name}"
     # Matchers in one object are AND. The expression uses the full
     # placeholder: the Caddyfile shorthand {tls_client_subject} is not
     # expanded in JSON, so it never matches.
+    # request_body runs before reverse_proxy and caps the body.
+    # A read past max_size becomes HTTP 413.
     return {
         "handle": [
             *_log_fields(),
             {"handler": "rewrite", "uri": path},
+            {"handler": "request_body", "max_size": max_body},
             {
                 "handler": "reverse_proxy",
                 "upstreams": [{"dial": upstream}],
@@ -199,6 +243,8 @@ def render_config(
     cert: str | None = None,
     key: str | None = None,
     acme_dns: str | None = None,
+    max_body: int | str | None = None,
+    max_body_peers: list[str] | None = None,
 ) -> dict:
     """Build the proxy config. Paths are stored as given."""
     listen = _require_text(listen, "--listen")
@@ -209,7 +255,15 @@ def render_config(
     admin_socket = _require_text(admin_socket, "--admin-socket")
     access_log = _require_text(access_log, "--access-log")
 
-    routes = [_peer_route(name, upstream) for name in peer_names(active)]
+    names = peer_names(active)
+    if max_body is None:
+        limit = DEFAULT_MAX_BODY
+    else:
+        limit = _positive_bytes(max_body, "--max-body")
+    overrides = _peer_overrides(names, max_body_peers)
+    routes = [
+        _peer_route(name, upstream, overrides.get(name, limit)) for name in names
+    ]
     routes.append(
         {
             "handle": [
@@ -293,6 +347,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--acme-dns",
         help="JSON file whose object is the ACME DNS provider",
     )
+    parser.add_argument(
+        "--max-body",
+        help="request body limit in bytes for every peer route (default 65536)",
+    )
+    parser.add_argument(
+        "--max-body-peer",
+        action="append",
+        default=None,
+        metavar="NAME=BYTES",
+        help="body limit for one peer; repeat for each peer",
+    )
     return parser.parse_args(argv)
 
 
@@ -309,6 +374,8 @@ def main(argv: list[str] | None = None) -> int:
         cert=args.cert,
         key=args.key,
         acme_dns=args.acme_dns,
+        max_body=args.max_body,
+        max_body_peers=args.max_body_peer,
     )
     sys.stdout.write(dump_config(config))
     return 0

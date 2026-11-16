@@ -140,6 +140,7 @@ run_hook() {
     --cert "$work/certs/server.pem" \
     --key "$work/keys/server.key" \
     --config-out "$config" \
+    "$@" \
     >>"$work/hook.log" 2>&1
   then
     echo "trial: proxy-reload failed; see $work/hook.log" >&2
@@ -179,6 +180,78 @@ http_get() {
     args+=(--cert "$cert" --key "$key")
   fi
   curl "${args[@]}"
+}
+
+# POST the file as the body. Curl's exit status is the function status.
+http_post() {
+  local cert=$1 key=$2 path=$3 data=$4 body=$5
+  curl \
+    --http1.1 --silent --max-time 5 --path-as-is \
+    --resolve "${name}:${port}:127.0.0.1" \
+    --cacert "$ca" \
+    --cert "$cert" --key "$key" \
+    -H "Content-Type: application/octet-stream" \
+    -H "Expect:" \
+    --data-binary "@${data}" \
+    -o "$body" -w "%{http_code}" \
+    "https://${name}:${port}${path}"
+}
+
+make_body() {
+  python3 -I - "$1" "$2" <<'PY'
+import pathlib, sys
+pathlib.Path(sys.argv[1]).write_bytes(b"x" * int(sys.argv[2]))
+PY
+}
+
+expect_post() {
+  local label=$1 cert=$2 key=$3 path=$4 data=$5 want=$6 want_body=${7:-}
+  local body http rc
+  body=$(mktemp "$work/body.XXXXXX")
+  set +e
+  http=$(http_post "$cert" "$key" "$path" "$data" "$body")
+  rc=$?
+  set -e
+  if [ "$rc" -ne 0 ]; then
+    bad "$label (curl exit $rc, http ${http:-none})"
+    rm -f "$body"
+    return
+  fi
+  if [ "$http" != "$want" ]; then
+    bad "$label (http $http, want $want, body $(cat "$body" 2>/dev/null || true))"
+    rm -f "$body"
+    return
+  fi
+  if [ -n "$want_body" ] && [ "$(cat "$body")" != "$want_body" ]; then
+    bad "$label (upstream body $(cat "$body"), want $want_body)"
+    rm -f "$body"
+    return
+  fi
+  rm -f "$body"
+  ok "$label"
+}
+
+# A completed upstream post is one line "<path> <length>". Poll so a body
+# that shows up just after the client is answered is still noticed.
+upstream_lacks() {
+  local label=$1 needle=$2
+  if python3 -I - "$work/upstream.seen" "$needle" <<'PY'
+import pathlib, sys, time
+path, needle = sys.argv[1], sys.argv[2]
+deadline = time.time() + 1
+while time.time() < deadline:
+    file = pathlib.Path(path)
+    text = file.read_text(encoding="ascii") if file.exists() else ""
+    if needle in text.splitlines():
+        sys.exit(1)
+    time.sleep(0.05)
+sys.exit(0)
+PY
+  then
+    ok "$label"
+  else
+    bad "$label (upstream accepted ${needle})"
+  fi
 }
 
 expect_status() {
@@ -306,6 +379,20 @@ def access_403(row):
         and serial != ""
     )
 
+def access_413(row):
+    request = row.get("request") or {}
+    uri = request.get("uri") or ""
+    remote = request.get("remote_ip") or ""
+    subject = row.get("client_subject") or ""
+    serial = row.get("client_serial") or ""
+    if row.get("status") != 413 or remote != "127.0.0.1" or serial == "":
+        return False
+    if want_uri and uri != want_uri:
+        return False
+    if want_subject and subject != want_subject:
+        return False
+    return True
+
 def handshake(row):
     logger = row.get("logger") or ""
     msg = (row.get("msg") or "").lower()
@@ -322,6 +409,8 @@ def handshake(row):
 path = sys.argv[1]
 kind = sys.argv[2]
 offset = int(sys.argv[3]) if len(sys.argv) > 3 and sys.argv[3] != "" else 0
+want_uri = sys.argv[4] if len(sys.argv) > 4 else ""
+want_subject = sys.argv[5] if len(sys.argv) > 5 else ""
 deadline = time.time() + 5
 while time.time() < deadline:
     try:
@@ -339,6 +428,8 @@ while time.time() < deadline:
         except json.JSONDecodeError:
             continue
         if kind == "403" and access_403(row):
+            sys.exit(0)
+        if kind == "413" and access_413(row):
             sys.exit(0)
         if kind == "handshake" and handshake(row):
             sys.exit(0)
@@ -379,7 +470,8 @@ cp "$work/certs/beta.pem" "$work/active/beta.pem"
 port=$(free_port)
 upstream_port=$(free_port)
 
-python3 -I - "$upstream_port" <<'PY' &
+: >"$work/upstream.seen"
+python3 -I - "$upstream_port" "$work/upstream.seen" <<'PY' &
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -394,10 +486,33 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", "0") or 0)
+        data = b""
+        while len(data) < length:
+            chunk = self.rfile.read(length - len(data))
+            if not chunk:
+                break
+            data += chunk
+        # A short read means the proxy closed the body early. Do not
+        # answer 200: that post did not arrive whole.
+        if len(data) != length:
+            self.close_connection = True
+            return
+        with open(seen, "a", encoding="ascii") as handle:
+            handle.write(f"{self.path} {len(data)}\n")
+        payload = str(len(data)).encode("ascii")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
     def log_message(self, fmt, *args):
         return
 
 port = int(sys.argv[1])
+seen = sys.argv[2]
 server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
 server.serve_forever()
 PY
@@ -723,6 +838,79 @@ else
   else
     ok "empty active folder refuses every handshake"
   fi
+fi
+
+# Body limit. This trial uses a small default so the posts stay short.
+# Unit tests cover the 65536 default. beta's override is higher, and
+# only beta's route uses it.
+cp "$work/certs/alpha-new.pem" "$work/active/alpha.pem"
+cp "$beta_cert" "$work/active/beta.pem"
+body_limit=64
+beta_limit=128
+make_body "$work/body-under" $((body_limit - 1))
+make_body "$work/body-at" "$body_limit"
+make_body "$work/body-over" $((body_limit + 1))
+make_body "$work/body-beta-at" "$beta_limit"
+make_body "$work/body-beta-over" $((beta_limit + 1))
+if ! run_hook --max-body "$body_limit" --max-body-peer "beta=${beta_limit}"; then
+  bad "body just under the limit gets through (hook failed)"
+  bad "body just over the limit is 413 (hook failed)"
+  bad "per-peer override takes effect for that peer only (hook failed)"
+elif ! python3 -I - "$config" "$body_limit" "$beta_limit" <<'PY'
+import json, sys
+path, default, beta = sys.argv[1:]
+default, beta = int(default), int(beta)
+routes = json.load(open(path, encoding="utf-8"))["apps"]["http"]["servers"]["agent-peers"]["routes"]
+sizes = {}
+for route in routes:
+    match = route.get("match")
+    if not match:
+        continue
+    for handle in route["handle"]:
+        if handle.get("handler") == "request_body":
+            sizes[match[0]["path"][0]] = handle["max_size"]
+ok = (
+    sizes.get("/webhooks/peer-alpha") == default
+    and sizes.get("/webhooks/peer-beta") == beta
+)
+sys.exit(0 if ok else 1)
+PY
+then
+  bad "body just under the limit gets through (rendered limits mismatch)"
+  bad "body just over the limit is 413 (rendered limits mismatch)"
+  bad "per-peer override takes effect for that peer only (rendered limits mismatch)"
+else
+  expect_post "body just under the limit gets through" \
+    "$alpha_cert" "$alpha_key" "/webhooks/peer-alpha" \
+    "$work/body-under" 200 "$((body_limit - 1))"
+  expect_post "body at the limit gets through" \
+    "$alpha_cert" "$alpha_key" "/webhooks/peer-alpha" \
+    "$work/body-at" 200 "$body_limit"
+  access_mark=0
+  if [ -f "$access_log" ]; then
+    access_mark=$(wc -c <"$access_log" | tr -d ' ')
+  fi
+  expect_post "body just over the limit is 413" \
+    "$alpha_cert" "$alpha_key" "/webhooks/peer-alpha" \
+    "$work/body-over" 413
+  wait_log "body just over the limit is logged" "$access_log" 413 "$access_mark" \
+    "/webhooks/peer-alpha" "CN=alpha"
+  upstream_lacks "body just over the limit does not reach upstream" \
+    "/webhooks/peer-alpha $((body_limit + 1))"
+  expect_post "per-peer override allows that peer a larger body" \
+    "$beta_cert" "$beta_key" "/webhooks/peer-beta" \
+    "$work/body-over" 200 "$((body_limit + 1))"
+  expect_post "per-peer override at its own limit gets through" \
+    "$beta_cert" "$beta_key" "/webhooks/peer-beta" \
+    "$work/body-beta-at" 200 "$beta_limit"
+  expect_post "per-peer override does not raise the other peer" \
+    "$alpha_cert" "$alpha_key" "/webhooks/peer-alpha" \
+    "$work/body-beta-at" 413
+  upstream_lacks "other peer's larger body does not reach upstream" \
+    "/webhooks/peer-alpha ${beta_limit}"
+  expect_post "per-peer override just over is 413" \
+    "$beta_cert" "$beta_key" "/webhooks/peer-beta" \
+    "$work/body-beta-over" 413
 fi
 
 echo "trial: ${passes} passed, ${fails} failed"
