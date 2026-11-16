@@ -462,7 +462,7 @@ Remote agents post to Bot Chat through a separate Caddy proxy. The host operator
 
 Each peer route applies its body limit before it forwards the request. A body over the limit is refused with 413, and Hermes does not accept the post.
 
-To tune a limit, edit the arguments of the host's reload hook, then run the hook. `--max-body` is the limit for every peer. `--max-body-peer <name>=<bytes>` is one peer's limit. Repeat that argument for each peer.
+To tune a limit, edit the arguments of the host's reload hook, then run the hook. `--max-body` is the limit for every peer. `--max-body-peer <name>=<bytes>` is one peer's limit. Repeat that argument for each peer. To revoke a peer that has its own limit, remove the pin and that `--max-body-peer <name>=…` argument from the hook, then run the hook. A leftover argument is an unknown peer, so the render fails and the hook leaves the old config in place.
 
 The rate limit is the Hermes webhook receiver's `rate_limit` (per minute, per route, default 30) in `platforms.webhook.extra`. That value is adapter-wide. The receiver's own `max_body_bytes` stays at its generic default. The proxy is the peer-specific gate.
 
@@ -474,7 +474,7 @@ Keep the receiver on loopback. In the config above, `platforms.webhook.extra.hos
 
 Give each peer route its own secret. The file that holds the secret is mode 0600.
 
-To revoke a peer, remove its pin, then run `proxy-reload`. A certificate revocation list does not stop a client. The pin is what the proxy trusts. If the reload fails, `proxy-reload` exits non-zero and prints the reason, and the proxy keeps trusting the pins it already loaded until a reload succeeds.
+To revoke a peer, remove its pin and any `--max-body-peer <name>=…` argument for that peer from the reload hook, then run the hook. A certificate revocation list does not stop a client. The pin is what the proxy trusts. If the reload fails, `proxy-reload` exits non-zero and prints the reason, and the proxy keeps trusting the pins it already loaded until a reload succeeds.
 
 ## Development
 

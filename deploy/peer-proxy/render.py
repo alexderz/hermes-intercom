@@ -92,7 +92,9 @@ def _positive_bytes(value: object, label: str) -> int:
         _die(f"{label} must be a positive integer, not {value!r}")
     shown: object = value
     if isinstance(value, str):
-        if not value.isdigit():
+        # isdigit() is true for non-ASCII digits. Some of those make
+        # int() raise, and others parse as a different number.
+        if not value.isascii() or not value.isdigit():
             _die(f"{label} must be a positive integer, not {value!r}")
         number = int(value)
     else:
@@ -113,7 +115,10 @@ def _peer_overrides(names: list[str], items: list[str] | None) -> dict[str, int]
         if sep == "" or name == "" or raw == "":
             _die(f"--max-body-peer must be <name>=<bytes>, not {item!r}")
         if name not in known:
-            _die(f"--max-body-peer {item!r}: unknown peer {name!r}")
+            _die(
+                f"--max-body-peer {item!r}: unknown peer {name!r} "
+                "(no active pin; remove this argument)"
+            )
         overrides[name] = _positive_bytes(raw, f"--max-body-peer {item!r}")
     return overrides
 

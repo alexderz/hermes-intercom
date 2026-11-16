@@ -446,6 +446,8 @@ class RenderTests(unittest.TestCase):
         self.assert_render_error(["--max-body", "-5"], "positive integer")
         self.assert_render_error(["--max-body", "12kb"], "positive integer")
         self.assert_render_error(["--max-body", ""], "positive integer")
+        self.assert_render_error(["--max-body", "²"], "positive integer")
+        self.assert_render_error(["--max-body", "١٢"], "positive integer")
         self.assert_render_error(
             ["--max-body", "9223372036854775808"],
             "positive integer",
@@ -472,7 +474,8 @@ class RenderTests(unittest.TestCase):
         )
         self.assert_render_error(
             ["--max-body-peer", "beta=10"],
-            "unknown peer 'beta'",
+            "--max-body-peer 'beta=10': unknown peer 'beta' "
+            "(no active pin; remove this argument)",
         )
         # The largest signed 64-bit byte count is accepted.
         out = io.StringIO()
@@ -484,6 +487,15 @@ class RenderTests(unittest.TestCase):
         self.assertEqual(
             self.body_limits(out.getvalue())["/webhooks/peer-alpha"],
             9223372036854775807,
+        )
+
+    def test_removed_pin_with_leftover_override(self):
+        pin = self.write_pin("beta.pem")
+        pin.unlink()
+        self.assert_render_error(
+            ["--max-body-peer", "beta=10"],
+            "--max-body-peer 'beta=10': unknown peer 'beta' "
+            "(no active pin; remove this argument)",
         )
 
     def test_acme_dns_must_be_an_object(self):
