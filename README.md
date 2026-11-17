@@ -457,7 +457,7 @@ Pins are named `<name>.pem`. Each one is that peer's client certificate, a top-l
 
 Remote agents post to Bot Chat through a separate Caddy proxy. The host operator installs the assets in [`deploy/peer-proxy/`](deploy/peer-proxy/). The plugin does not import them.
 
-- [`render.py`](deploy/peer-proxy/render.py) writes the proxy's Caddy JSON from the active pin folder. `--access-log <path>` is required. `--max-body <bytes>` sets the request body limit on every peer route. When that flag is absent the limit is 65536. `--max-body-peer <name>=<bytes>` sets a different limit for one peer. Repeat it for each peer that needs its own limit.
+- [`render.py`](deploy/peer-proxy/render.py) writes the proxy's Caddy JSON from the active pin folder. `--access-log <path>` is required. `--max-body <bytes>` sets the request body limit on every peer route. When that flag is absent the limit is 65536. `--max-body-peer <name>=<bytes>` sets a different limit for one peer. Repeat it for each peer that needs its own limit. A name with no active pin is ignored, with a warning.
 - [`proxy-reload`](deploy/peer-proxy/proxy-reload) renders to a temporary file, validates it, reloads Caddy with `--force`, and only then replaces the config file. It takes the same arguments as `render.py`, including `--max-body` and `--max-body-peer`, plus `--config-out`. If the reload fails it exits non-zero, prints the reason, and leaves the running proxy and the config file unchanged.
 - [`caddy-agent-peers.service`](deploy/peer-proxy/caddy-agent-peers.service) is the systemd unit template. It runs `caddy run --config <config-json>` as an unprivileged user. The admin socket is the one rendered into the JSON. Replace each placeholder before installing.
 - [`trial.sh`](deploy/peer-proxy/trial.sh) proves the TLS and routing rules on loopback with the installed `caddy`.
@@ -468,7 +468,7 @@ Remote agents post to Bot Chat through a separate Caddy proxy. The host operator
 
 Each peer route applies its body limit before it forwards the request. A body over the limit is refused with 413, and Hermes does not accept the post.
 
-To tune a limit, edit the arguments of the host's reload hook, then run the hook. `--max-body` is the limit for every peer. `--max-body-peer <name>=<bytes>` is one peer's limit. Repeat that argument for each peer. To revoke a peer that has its own limit, remove the pin and that `--max-body-peer <name>=…` argument from the hook, then run the hook. A leftover argument is an unknown peer, so the render fails and the hook leaves the old config in place.
+To tune a limit, edit the arguments of the host's reload hook, then run the hook. `--max-body` is the limit for every peer. `--max-body-peer <name>=<bytes>` is one peer's limit. Repeat that argument for each peer. To revoke a peer that has its own limit, remove the pin and run the hook. A leftover `--max-body-peer` for a name with no active pin is ignored, with a warning. Removing that argument from the hook afterwards is tidy but not required.
 
 The rate limit is the Hermes webhook receiver's `rate_limit` (per minute, per route, default 30) in `platforms.webhook.extra`. That value is adapter-wide. The receiver's own `max_body_bytes` stays at its generic default. The proxy is the peer-specific gate.
 
@@ -480,7 +480,7 @@ Keep the receiver on loopback. In the config above, `platforms.webhook.extra.hos
 
 Give each peer route its own secret. The file that holds the secret is mode 0600.
 
-To revoke a peer, remove its pin and any `--max-body-peer <name>=…` argument for that peer from the reload hook, then run the hook. A certificate revocation list does not stop a client. The pin is what the proxy trusts. If the reload fails, `proxy-reload` exits non-zero and prints the reason, and the proxy keeps trusting the pins it already loaded until a reload succeeds.
+To revoke a peer, remove its pin and run the hook. A leftover `--max-body-peer <name>=…` for that peer is ignored, with a warning. Removing it from the hook afterwards is tidy but not required. A certificate revocation list does not stop a client. The pin is what the proxy trusts. If the reload fails, `proxy-reload` exits non-zero and prints the reason, and the proxy keeps trusting the pins it already loaded until a reload succeeds.
 
 ## Development
 

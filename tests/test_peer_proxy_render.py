@@ -473,9 +473,25 @@ class RenderTests(unittest.TestCase):
             "<name>=<bytes>",
         )
         self.assert_render_error(
-            ["--max-body-peer", "beta=10"],
-            "--max-body-peer 'beta=10': unknown peer 'beta' "
-            "(no active pin; remove this argument)",
+            ["--max-body-peer", "Alpha=10"],
+            "not a peer name",
+        )
+        self.assert_render_error(
+            ["--max-body-peer", "has_under=10"],
+            "not a peer name",
+        )
+        self.assert_render_error(
+            ["--max-body-peer", ("n" * 64) + "=10"],
+            "not a peer name",
+        )
+        # A bad value is a typo even when that name has no pin.
+        self.assert_render_error(
+            ["--max-body-peer", "beta=0"],
+            "positive integer",
+        )
+        self.assert_render_error(
+            ["--max-body-peer", "beta=nope"],
+            "positive integer",
         )
         # The largest signed 64-bit byte count is accepted.
         out = io.StringIO()
@@ -490,12 +506,54 @@ class RenderTests(unittest.TestCase):
         )
 
     def test_removed_pin_with_leftover_override(self):
+        self.write_pin("alpha.pem")
         pin = self.write_pin("beta.pem")
         pin.unlink()
-        self.assert_render_error(
-            ["--max-body-peer", "beta=10"],
-            "--max-body-peer 'beta=10': unknown peer 'beta' "
-            "(no active pin; remove this argument)",
+        out = io.StringIO()
+        err = io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            self.assertEqual(
+                render.main(
+                    self.main_argv(
+                        "--max-body",
+                        "100",
+                        "--max-body-peer",
+                        "alpha=40",
+                        "--max-body-peer",
+                        "beta=250",
+                    )
+                ),
+                0,
+            )
+        self.assertEqual(
+            err.getvalue(),
+            "ignoring --max-body-peer for beta: no active pin\n",
+        )
+        self.assertEqual(
+            self.body_limits(out.getvalue()),
+            {"/webhooks/peer-alpha": 40},
+        )
+        self.assertNotIn("/webhooks/peer-beta", out.getvalue())
+
+    def test_empty_folder_with_override_is_deny_all(self):
+        err = io.StringIO()
+        with redirect_stderr(err):
+            config = self.config(max_body_peers=["beta=131072"])
+        self.assertEqual(
+            err.getvalue(),
+            "ignoring --max-body-peer for beta: no active pin\n",
+        )
+        plain = io.StringIO()
+        with redirect_stderr(plain):
+            expected = self.config()
+        self.assertEqual(plain.getvalue(), "")
+        self.assertEqual(config, expected)
+        routes = self.server(config)["routes"]
+        self.assertEqual(len(routes), 1)
+        self.assertNotIn("match", routes[0])
+        self.assertEqual(
+            routes[0]["handle"][-1],
+            {"handler": "static_response", "status_code": 403},
         )
 
     def test_acme_dns_must_be_an_object(self):

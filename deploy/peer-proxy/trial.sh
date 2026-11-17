@@ -913,6 +913,34 @@ else
     "$work/body-beta-over" 413
 fi
 
+# Revocation with the override still configured. The pin is removed and
+# the hook runs again with the same --max-body-peer. The reload must
+# succeed, and a new connection with the removed cert is refused.
+cp "$beta_cert" "$work/active/beta.pem"
+if ! run_hook --max-body "$body_limit" --max-body-peer "beta=${beta_limit}"; then
+  bad "leftover override does not block revocation (setup hook failed)"
+else
+  rm -f "$work/active/beta.pem"
+  hook_mark=$(wc -c <"$work/hook.log" | tr -d ' ')
+  if ! run_hook --max-body "$body_limit" --max-body-peer "beta=${beta_limit}"; then
+    bad "leftover override does not block revocation (hook failed)"
+  else
+    hook_tail=$(tail -c +"$((hook_mark + 1))" "$work/hook.log" || true)
+    case $hook_tail in
+      *"ignoring --max-body-peer for beta: no active pin"*)
+        if ! probe_refused "$beta_cert" "$beta_key" own; then
+          bad "leftover override does not block revocation ($(tr '\n' ' ' <"$work/probe.txt"))"
+        else
+          ok "leftover override does not block revocation"
+        fi
+        ;;
+      *)
+        bad "leftover override does not block revocation (no warning)"
+        ;;
+    esac
+  fi
+fi
+
 echo "trial: ${passes} passed, ${fails} failed"
 if [ "$fails" -ne 0 ]; then
   echo "trial: caddy log:" >&2

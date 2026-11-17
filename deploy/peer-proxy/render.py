@@ -13,7 +13,9 @@ TLS logger writes it to ``<path>.tls``.
 Each peer route limits the request body with the ``request_body`` handler
 (``max_size``) before ``reverse_proxy``. ``--max-body`` sets that limit
 for every peer. When the flag is absent the limit is 65536 bytes.
-``--max-body-peer <name>=<bytes>`` overrides it for one peer.
+``--max-body-peer <name>=<bytes>`` overrides it for one peer. A name
+with no pin in the active folder is ignored, with one line on stderr.
+A malformed argument is an error.
 """
 
 from __future__ import annotations
@@ -105,7 +107,13 @@ def _positive_bytes(value: object, label: str) -> int:
 
 
 def _peer_overrides(names: list[str], items: list[str] | None) -> dict[str, int]:
-    """Map peer name to a body limit. The last value for a name wins."""
+    """Map peer name to a body limit. The last value for a name wins.
+
+    A well-formed name with no active pin is ignored. Revocation deletes
+    the pin and reruns the hook; a leftover override must not stop that
+    reload. A missing ``=``, a name that is not a peer name, or a value
+    that is not a positive integer is a typo, and that is still an error.
+    """
     overrides: dict[str, int] = {}
     known = set(names)
     for item in items or []:
@@ -114,12 +122,19 @@ def _peer_overrides(names: list[str], items: list[str] | None) -> dict[str, int]
         name, sep, raw = item.partition("=")
         if sep == "" or name == "" or raw == "":
             _die(f"--max-body-peer must be <name>=<bytes>, not {item!r}")
-        if name not in known:
+        if not PEER_NAME.fullmatch(name):
             _die(
-                f"--max-body-peer {item!r}: unknown peer {name!r} "
-                "(no active pin; remove this argument)"
+                f"--max-body-peer {item!r}: {name!r} is not a peer name "
+                f"matching {PEER_NAME.pattern}"
             )
-        overrides[name] = _positive_bytes(raw, f"--max-body-peer {item!r}")
+        limit = _positive_bytes(raw, f"--max-body-peer {item!r}")
+        if name not in known:
+            print(
+                f"ignoring --max-body-peer for {name}: no active pin",
+                file=sys.stderr,
+            )
+            continue
+        overrides[name] = limit
     return overrides
 
 
@@ -361,7 +376,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="append",
         default=None,
         metavar="NAME=BYTES",
-        help="body limit for one peer; repeat for each peer",
+        help=(
+            "body limit for one peer; repeat for each peer. "
+            "A name with no active pin is ignored"
+        ),
     )
     return parser.parse_args(argv)
 
