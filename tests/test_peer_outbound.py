@@ -10,13 +10,16 @@ import json
 import logging
 import os
 import shutil
+import socket
 import sqlite3
 import ssl
 import sys
 import tempfile
 import threading
 import time
+import traceback
 import unittest
+import urllib.request
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -41,6 +44,7 @@ OTHER = "local-other"
 PEER = "remote-bot"
 HMAC_SECRET = "hmac-secret-77ab"
 URL_SECRET = "s3cret-token-9f3a"
+BEARER_KEY = "bearer-key-6c1e8a40"
 ONLY_BOT_CHAT = "only Bot Chat talks to remote agents; message Bot Chat"
 WAITING = "a remote agent cannot hold your turn; use requested"
 
@@ -69,7 +73,8 @@ class _Handler(BaseHTTPRequestHandler):
             if server.delay:
                 time.sleep(server.delay)
             # hmac-v2 posts the bare hook. A bad or missing signature is 401; url-auth
-            # posts the secret in the path and carries no signature.
+            # posts the secret in the path and carries no signature. bearer posts
+            # somewhere other than /hook and carries Authorization, not a signature.
             if method == "POST" and self.path == "/hook" and not self._hmac_ok(body):
                 self._respond(401)
             else:
@@ -352,8 +357,11 @@ class OutboundTestBase(unittest.TestCase):
         self.secret_url = f"{self.hook_url}/{URL_SECRET}"
         self.hmac_file = self.home / "hmac.secret"
         self.url_file = self.home / "url.secret"
+        self.bearer_file = self.home / "bearer.secret"
+        self.bearer_url = f"https://127.0.0.1:{self.port}/routine"
         self.hmac_file.write_text(HMAC_SECRET + "\n", encoding="utf-8")
         self.url_file.write_text(self.secret_url + "\n", encoding="utf-8")
+        self.bearer_file.write_text(BEARER_KEY + "\n", encoding="utf-8")
         self.write_peers([self.peer(PEER)])
         self.ctx = FakeCtx(user_name="Sam")
         self.log = _Log()
@@ -394,9 +402,9 @@ class OutboundTestBase(unittest.TestCase):
 
     def peer(self, name, *, auth="hmac-v2", url=None, secret_file=None):
         if secret_file is None:
-            secret_file = self.hmac_file if auth == "hmac-v2" else self.url_file
+            secret_file = {"hmac-v2": self.hmac_file, "bearer": self.bearer_file}.get(auth, self.url_file)
         if url is None:
-            url = self.hook_url if auth == "hmac-v2" else f"{self.hook_url}/\u2026"
+            url = {"url": f"{self.hook_url}/\u2026", "bearer": self.bearer_url}.get(auth, self.hook_url)
         return {"name": name, "url": url, "auth": auth, "secret_file": str(secret_file)}
 
     def write_peers(self, data):
@@ -426,7 +434,7 @@ class OutboundTestBase(unittest.TestCase):
             text += "\n" + json.dumps(blob, default=str)
         for row in self.rows():
             text += "\n" + json.dumps(row, default=str)
-        for secret in (HMAC_SECRET, URL_SECRET):
+        for secret in (HMAC_SECRET, URL_SECRET, BEARER_KEY):
             self.assertNotIn(secret, text)
 
     @staticmethod
@@ -603,7 +611,10 @@ class RefusalTests(OutboundTestBase):
 
     def test_an_unreadable_secret_records_nothing_and_names_no_path(self):
         missing = self.home / "missing-secret"
-        for auth, path in (("hmac-v2", missing), ("url", self.home / "also-missing")):
+        for auth, path in (
+                ("hmac-v2", missing),
+                ("url", self.home / "also-missing"),
+                ("bearer", self.home / "bearer-missing")):
             with self.subTest(auth=auth):
                 self.write_peers([self.peer(PEER, auth=auth, secret_file=path)])
                 receipt = self.send()
@@ -622,6 +633,34 @@ class RefusalTests(OutboundTestBase):
         self.assertEqual(receipt["error"], "secret-unreadable")
         self.assertEqual(self.rows(), [])
         self.assertEqual(self.server.seen, [])
+
+    def test_a_bearer_key_with_whitespace_or_a_control_is_unreadable(self):
+        cases = {
+            "empty": "",
+            "blank": " \n\t",
+            "space": f"ab {BEARER_KEY}",
+            "tab": "ab\tcd",
+            "newline": f"{BEARER_KEY}\nmore",
+            "cr": "ab\rcd",
+            "nul": "ab\x00cd",
+            "del": "ab\x7fcd",
+            "prefixed": f"Bearer {BEARER_KEY}",
+        }
+        for name, text in cases.items():
+            with self.subTest(name=name):
+                self.server.seen.clear()
+                self.bearer_file.write_text(text, encoding="utf-8")
+                self.write_peers([self.peer(PEER, auth="bearer")])
+                receipt = self.send()
+                self.assertFalse(receipt["ok"], receipt)
+                self.assertEqual(receipt["error"], "secret-unreadable")
+                self.assertEqual(receipt["message"], peers.SECRET_UNREADABLE)
+                self.assertNotIn("exit", receipt)
+                self.assertIsNone(receipt["message_id"])
+                self.assertNotIn(BEARER_KEY, json.dumps(receipt))
+                self.assertEqual(self.rows(), [])
+                self.assertEqual(self.server.seen, [])
+                self.assert_clean(receipt)
 
     def test_empty_body_is_refused_after_the_gates(self):
         receipt = self.send("   ")
@@ -864,6 +903,115 @@ class PostTests(OutboundTestBase):
         row = record.get(receipt["message_id"])
         self.assertEqual(row["result"], "error")
         self.assertEqual(row["detail"], "HTTP 401")
+        self.assert_clean(receipt)
+
+    def test_a_bearer_peer_loads(self):
+        self.write_peers([self.peer(PEER, auth="bearer")])
+        loaded = peers.load()
+        self.assertEqual(list(loaded), [PEER])
+        peer = loaded[PEER]
+        self.assertEqual(peer.auth, "bearer")
+        self.assertEqual(peer.url, self.bearer_url)
+        self.assertIn("bearer", peers.AUTH_MODES)
+        shown = peers.for_bot_chat(BOT)
+        self.assertEqual(shown, [{"to": f"peer:{PEER}", "url": self.bearer_url}])
+        self.assertNotIn(BEARER_KEY, json.dumps(shown))
+        self.write_peers([self.peer(PEER, auth="bearer", url=f"http://127.0.0.1:{self.port}/routine")])
+        self.assertEqual(peers.load(), {})
+        self.assert_refused(self.send(), "unknown-peer")
+
+    def test_bearer_posts_the_authorization_header_and_no_hmac(self):
+        self.bearer_file.write_text(f"\n  {BEARER_KEY}\t\n", encoding="utf-8")
+        self.write_peers([self.peer(PEER, auth="bearer")])
+        receipt = self.send("via bearer", reply_mode="requested")
+        self.assertTrue(receipt["ok"], receipt)
+        self.assertEqual(receipt["receipt"], "delivered")
+        self.assertEqual(receipt["message"], "delivered (HTTP 200)")
+        self.assertEqual(receipt["url"], self.bearer_url)
+        [item] = self.server.seen
+        self.assertEqual(item["method"], "POST")
+        self.assertEqual(item["path"], "/routine")
+        self.assertEqual(item["headers"].get("authorization"), f"Bearer {BEARER_KEY}")
+        self.assertNotIn("x-webhook-signature-v2", item["headers"])
+        self.assertNotIn("x-webhook-timestamp", item["headers"])
+        payload = json.loads(item["body"])
+        self.assertEqual(payload["from"], "hermes")
+        self.assertEqual(payload["text"], "via bearer")
+        self.assertIs(payload["wants_reply"], True)
+        self.assertNotIn(BEARER_KEY, json.dumps(receipt))
+        row = record.get(receipt["message_id"])
+        self.assertEqual(row["result"], "delivered")
+        self.assertEqual(row["detail"], "HTTP 200")
+        self.assertEqual(row["address"], f"peer:{PEER}")
+        self.assertNotIn(BEARER_KEY, json.dumps(row))
+        self.assert_clean(receipt)
+
+        self.server.seen.clear()
+        self.server.status = 204
+        accepted = self.send("accepted")
+        self.assertTrue(accepted["ok"], accepted)
+        self.assertEqual(accepted["message"], "delivered (HTTP 204)")
+        self.assertEqual(record.get(accepted["message_id"])["detail"], "HTTP 204")
+        self.assertEqual(self.server.seen[-1]["headers"].get("authorization"), f"Bearer {BEARER_KEY}")
+        self.assert_clean(accepted)
+        self.server.status = 200
+
+    def test_the_bearer_key_is_absent_from_an_http_error_and_a_connection_error(self):
+        seen = []
+        real_open = urllib.request.OpenerDirector.open
+
+        def open_and_keep(opener, fullurl, data=None, timeout=socket._GLOBAL_DEFAULT_TIMEOUT):
+            header = None
+            if isinstance(fullurl, urllib.request.Request):
+                header = fullurl.get_header("Authorization")
+            try:
+                return real_open(opener, fullurl, data, timeout)
+            except Exception as exc:
+                seen.append((header, exc))
+                raise
+
+        self.bearer_file.write_text(BEARER_KEY + "\n", encoding="utf-8")
+        self.write_peers([self.peer(PEER, auth="bearer")])
+        self.server.status = 500
+        with mock.patch.object(urllib.request.OpenerDirector, "open", open_and_keep):
+            http_receipt = self.send("http fails")
+        self.assertEqual(http_receipt["message"], "not delivered (HTTP 500)")
+        self.assertEqual(http_receipt["error"], "HTTP 500")
+        self.assertEqual(len(self.server.seen), 1)
+        self.assertEqual(self.server.seen[0]["headers"].get("authorization"), f"Bearer {BEARER_KEY}")
+        self.assertNotIn("x-webhook-signature-v2", self.server.seen[0]["headers"])
+        self._assert_bearer_hidden(http_receipt, seen)
+        self.server.status = 200
+
+        seen.clear()
+        self.log.lines.clear()
+        self.server.seen.clear()
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            closed = sock.getsockname()[1]
+        self.write_peers([self.peer(
+            PEER, auth="bearer", url=f"https://127.0.0.1:{closed}/routine")])
+        with mock.patch.object(urllib.request.OpenerDirector, "open", open_and_keep):
+            conn_receipt = self.send("connect fails")
+        self.assertFalse(conn_receipt["ok"], conn_receipt)
+        self.assertIsNotNone(conn_receipt["message_id"])
+        self.assertNotEqual(conn_receipt["error"], "delivery-unknown")
+        self.assertNotIn("HTTP", conn_receipt["error"])
+        self.assertEqual(self.server.seen, [])
+        self._assert_bearer_hidden(conn_receipt, seen)
+
+    def _assert_bearer_hidden(self, receipt, seen):
+        self.assertTrue(seen)
+        text = json.dumps(receipt)
+        text += "\n" + "\n".join(self.log.lines)
+        for row in self.rows():
+            text += "\n" + json.dumps(row, default=str)
+        for header, exc in seen:
+            self.assertEqual(header, "Bearer " + BEARER_KEY)
+            text += "\n" + str(exc)
+            text += "\n" + repr(exc)
+            text += "\n" + "".join(traceback.format_exception(exc))
+        self.assertNotIn(BEARER_KEY, text)
         self.assert_clean(receipt)
 
     def test_the_post_runs_on_the_calling_thread(self):

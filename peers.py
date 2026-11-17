@@ -6,9 +6,11 @@ list with one object per remote agent:
 - ``name``: ``^[a-z0-9-]{1,63}$``; the same string is the certificate CN, the webhook route
   (``peer-<name>``) and the address (``peer:<name>``);
 - ``url``: the agent's webhook. For ``auth: url`` this is the same URL with the secret part
-  replaced by ``…``, and it is what ``list`` and receipts show. Only an ``https://`` URL is a
+  replaced by ``…``, and it is what ``list`` and receipts show. For ``auth: bearer`` it is the
+  plain webhook, shown as it is, because it holds no secret. Only an ``https://`` URL is a
   peer; anything else is not loaded;
-- ``auth``: ``url`` (the secret is the full URL, in the secret file) or ``hmac-v2``;
+- ``auth``: ``url`` (the secret is the full URL, in the secret file), ``hmac-v2``, or
+  ``bearer`` (the secret file holds the key alone, with no ``Bearer `` prefix);
 - ``secret_file``: where the secret is kept.
 
 ``load()`` reads it fresh on every call. A missing, unreadable or malformed file, or any bad
@@ -30,6 +32,7 @@ import re
 import secrets
 import ssl
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -40,7 +43,7 @@ logger = logging.getLogger(__name__)
 
 PLUGIN = "intercom"
 FILENAME = "peers.json"
-AUTH_MODES = ("url", "hmac-v2")
+AUTH_MODES = ("url", "hmac-v2", "bearer")
 NAME_RE = re.compile(r"^[a-z0-9-]{1,63}$")
 PREFIX = "peer:"
 FROM = "hermes"
@@ -89,7 +92,8 @@ def for_bot_chat(sender) -> list[dict] | None:
     """Configured peers as ``peer:<name>`` when *sender* is the default profile's Bot Chat.
 
     ``None`` for every other caller, so ``list`` can omit the key. Each item's ``url`` is the
-    entry's ``url`` (already redacted, for ``auth: url``). The secret file is never read here.
+    entry's ``url`` (already redacted, for ``auth: url``; the plain webhook, for ``bearer``).
+    The secret file is never read here.
     """
     if not _on_default_profile() or not _is_bot_chat(sender):
         return None
@@ -108,8 +112,9 @@ def send(sender, to, message, *, delivery="steer", reply_mode=None, kind="send",
 
     ``reply: none`` posts ``wants_reply: false``, ``requested`` posts ``true``, and ``waiting``
     is refused. A reply (``optional``, with ``reply_to``) posts ``wants_reply: false``. The row
-    is recorded before the POST. TLS is verified, redirects are not followed, and the secret is
-    never put in the receipt or the log.
+    is recorded before the POST. TLS is verified, redirects are not followed, and the secret
+    (the URL, the HMAC key, or the bearer key) is never put in the receipt, the record, the
+    log, an exception message, or a repr.
     """
     text = to.strip() if isinstance(to, str) else ""
     reply_to = reply_to or None
@@ -130,7 +135,7 @@ def send(sender, to, message, *, delivery="steer", reply_mode=None, kind="send",
         return _refused(text, delivery, reply_mode, "unknown-peer", ONLY_BOT_CHAT)
     if target == "secret":
         return _refused(text, delivery, reply_mode, "secret-unreadable", SECRET_UNREADABLE, exit_code=None)
-    url, signing_key = target
+    url, signing_key, bearer_key = target
 
     message_id = secrets.token_hex(4)
     raw = _payload(message_id, body, wants_reply=wants_reply, reply_to=reply_to)
@@ -141,6 +146,9 @@ def send(sender, to, message, *, delivery="steer", reply_mode=None, kind="send",
         headers["X-Webhook-Timestamp"] = stamp
         headers["X-Webhook-Signature-V2"] = hmac.new(
             signing_key.encode("utf-8"), stamp.encode("utf-8") + b"." + raw, hashlib.sha256).hexdigest()
+    if bearer_key is not None:
+        # The key is this header's value and nothing else. No HMAC headers.
+        headers["Authorization"] = "Bearer " + bearer_key
     status, problem = _exchange(url, raw, headers)
     return _finish(text, peer, message_id, delivery=delivery, reply_mode=reply_mode,
                    status=status, problem=problem)
@@ -269,11 +277,25 @@ def _empty(sender, peer: Peer, body: str, *, delivery, reply_mode, reply_to) -> 
     return fields
 
 
+def _unusable_bearer(key: str) -> bool:
+    """True when *key* cannot be the single token of an ``Authorization`` header.
+
+    Surrounding whitespace is already trimmed. A key with whitespace or a control
+    character is refused: ``http.client`` quotes a bad header value into the
+    exception message and its repr, and the key must not appear in either.
+    """
+    return (not key) or any(
+        char.isspace() or unicodedata.category(char) == "Cc" for char in key)
+
+
 def _target(peer: Peer):
-    """``(post url, hmac secret or None)``, ``"secret"`` when the file cannot be read, else None.
+    """``(post url, hmac secret or None, bearer key or None)``, ``"secret"`` when the file
+    cannot be used, else None.
 
     ``None`` means this entry is not a peer (the URL that would be posted is not ``https://``).
-    The secret itself is not logged and not returned anywhere but the HMAC key.
+    The secret itself is not logged. A bearer key is returned only when the file holds that
+    key alone; whitespace or a control character is ``"secret"``, the same as an empty or
+    unreadable file.
     """
     try:
         secret = Path(peer.secret_file).read_text(encoding="utf-8").strip()
@@ -283,9 +305,14 @@ def _target(peer: Peer):
         return "secret"
     if peer.auth == "url":
         url = secret if _is_https(secret) else ""
-        return (url, None) if url else None
+        return (url, None, None) if url else None
+    if peer.auth == "bearer":
+        if _unusable_bearer(secret):
+            return "secret"
+        # load() already dropped a peer whose url is not https.
+        return peer.url.strip(), None, secret
     # load() already dropped a peer whose url is not https.
-    return peer.url.strip(), secret
+    return peer.url.strip(), secret, None
 
 
 def _payload(message_id: str, text: str, *, wants_reply: bool, reply_to) -> bytes:
@@ -354,8 +381,8 @@ def _exchange(url: str, data: bytes, headers: dict) -> tuple[int | None, str | N
     """POST *data* to *url*. ``(status, None)`` or ``(None, problem)``.
 
     TLS is the default context, so verification stays on. No proxy: the URL can carry the
-    secret. Any failure is the exception type (or ``delivery-unknown``); ``str(exc)`` is
-    never used, because it can contain the secret URL.
+    secret. Any failure is the exception type (or ``delivery-unknown``). ``str(exc)`` and
+    ``repr(exc)`` are never used: either can quote the secret URL or a bearer key.
     """
     if not _is_https(url):
         return None, "not-https"
