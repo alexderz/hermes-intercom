@@ -425,8 +425,8 @@ In the double-quoted `prompt`, each `\n` is a newline. The rendered message is t
 |---|---|
 | `name` | `^[a-z0-9-]{1,63}$`. The same string is the certificate subject `CN`, the route `peer-<name>` and the address `peer:<name>`. |
 | `url` | The peer's webhook. Only an `https://` URL is loaded. |
-| `auth` | `hmac-v2` or `url`. |
-| `secret_file` | Path to a file that holds: for `hmac-v2`, the HMAC secret Hermes signs its post with; for `url`, the full secret `https://` URL. For `url`, the `url` field is that URL with the secret part replaced by `…`, which is what list and receipts show. |
+| `auth` | `hmac-v2`, `url`, or `bearer`. |
+| `secret_file` | Path to a file that holds: for `hmac-v2`, the HMAC secret Hermes signs its post with; for `url`, the full secret `https://` URL; for `bearer`, the key alone, with no `Bearer ` prefix. For `url`, the `url` field is that URL with the secret part replaced by `…`, which is what list and receipts show. For `bearer`, `url` is the plain webhook, and list and receipts show it as it is. Surrounding whitespace on a bearer key is ignored. A key that contains whitespace or a control character, or an empty or unreadable file, is not sent. |
 
 TLS is always verified. A redirect is an error.
 
@@ -437,6 +437,12 @@ TLS is always verified. A redirect is an error.
     "url": "https://<peer-webhook>",
     "auth": "hmac-v2",
     "secret_file": "<secret-file>"
+  },
+  {
+    "name": "<routine-name>",
+    "url": "https://<routine-webhook>",
+    "auth": "bearer",
+    "secret_file": "<key-file>"
   }
 ]
 ```
