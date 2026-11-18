@@ -322,9 +322,10 @@ _GIST_QUOTES = str.maketrans({
     "“": '"', "”": '"', "„": '"', "‟": '"', "«": '"', "»": '"',
 })
 
-# Leading Markdown the fallback strips before it takes a sentence: a heading,
-# a quote, a list marker, and emphasis or code that wraps the start of the line.
+# Headings, quotes and list markers come off the start of the fallback line.
+# Emphasis and code markers are removed from the whole line, below.
 _MD_LEAD_RE = re.compile(r"^(?:\*\*|__|`|#{1,6}\s*|>\s*|[-*]\s+|\d+\.\s+)")
+_MD_INLINE_RE = re.compile(r"\*\*|__|`")
 
 
 def clean_gist(value) -> str:
@@ -350,13 +351,19 @@ def clean_gist(value) -> str:
 
 
 def _strip_markdown_lead(line: str) -> str:
-    """Drop leading Markdown markers, after an invisible prefix."""
+    """Drop Markdown the fallback must not show, after an invisible prefix.
+
+    Headings, quotes and list markers come off the start only. ``**``, ``__``
+    and backticks come off the whole line, so a closing marker does not stay
+    on the notice row. Single ``*`` and ``_`` stay.
+    """
     text = _visible_start(line).strip()
     while True:
         match = _MD_LEAD_RE.match(text)
         if match is None:
-            return text
+            break
         text = text[match.end():].lstrip()
+    return _MD_INLINE_RE.sub("", text).strip()
 
 
 def fallback_gist(body: str) -> str:
@@ -364,7 +371,8 @@ def fallback_gist(body: str) -> str:
 
     Echo headers are dropped first. The first line that is not empty and does
     not open with ``📡`` or a notice line is used. Leading Markdown markers
-    come off, then the first sentence, then :func:`clean_gist`.
+    come off, ``**``, ``__`` and backticks come off that whole line, then the
+    first sentence, then :func:`clean_gist`.
     """
     stripped = _strip_echo_headers(body or "")
     for line in stripped.splitlines():

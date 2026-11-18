@@ -219,8 +219,13 @@ class WakeTests(KeyedQueueTestBase):
     def test_a_wake_uses_the_wake_line_fallback_not_the_stored_gist(self):
         receipt = self.send("build state: verifying G3", gist="The build is ready to merge.")
         wake = self.owner.wakes()[0]["text"]
-        line = "keyed update `build-state` from `status-script`; the current version follows."
+        # The wake body keeps its backticks. The notice line is the fallback, which strips them.
+        line = "keyed update build-state from status-script; the current version follows."
         self.assertEqual(wake.splitlines()[0], f"Message from {MARK} status-script: \u201c{line}\u201d")
+        self.assertIn(
+            "keyed update `build-state` from `status-script`; the current version follows.",
+            "\n".join(wake.splitlines()[1:]),
+        )
         self.assertNotIn("ready to merge", wake)
         row = record.get(receipt["message_id"])
         self.assertEqual(row["gist"], "The build is ready to merge.")

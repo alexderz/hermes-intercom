@@ -1178,8 +1178,14 @@ class GistTests(unittest.TestCase):
             "\n"
             "**Thinking\u2026**\n"
         )
-        # The chosen line is the Markdown one. It cleans to something, so later lines are not used.
-        self.assertEqual(FRAME.fallback_gist(body), "Thinking\u2026**")
+        # The chosen line is the Markdown one. Closing markers come off, so later lines are not used.
+        self.assertEqual(FRAME.fallback_gist(body), "Thinking\u2026")
+        self.assertEqual(
+            FRAME.fallback_gist("**Thinking on fixed the labyrinth test \u2026**"),
+            "Thinking on fixed the labyrinth test \u2026",
+        )
+        self.assertEqual(FRAME.fallback_gist("`code` thing. x"), "code thing.")
+        self.assertEqual(FRAME.fallback_gist("__bold__ start. x"), "bold start.")
         self.assertEqual(
             FRAME.fallback_gist("See e.g. the March export. Then stop."),
             "See e.g. the March export.",
