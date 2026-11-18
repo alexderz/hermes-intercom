@@ -320,9 +320,12 @@ class SharedSenderTests(RepliesTestBase):
     def test_null_scope_with_a_messaging_source_is_shared(self):
         row = {"id": "abcd1234", "reply_mode": "requested", "sender_chat_scope": None,
                "sender_source": "telegram"}
-        self.assertEqual(replies.reply_for(row, "whole answer"), ("stored", None, "shared-chat-no-block"))
+        self.assertEqual(
+            replies.reply_for(row, "whole answer"),
+            ("stored", None, "shared-chat-no-block", None),
+        )
         row["sender_source"] = "cli"
-        self.assertEqual(replies.reply_for(row, "whole answer"), ("sent", "whole answer", None))
+        self.assertEqual(replies.reply_for(row, "whole answer"), ("sent", "whole answer", None, None))
 
     def test_private_messaging_sender_gets_the_whole_answer(self):
         self.add("tg-private", "Sam DM", "telegram",
@@ -519,6 +522,73 @@ class AskTests(RepliesTestBase):
         self.assertEqual(replies._timeout(1), 10)
         self.assertEqual(replies._timeout(99999), 3600)
         self.assertEqual(replies._timeout("x"), 600)
+
+
+class GistTests(RepliesTestBase):
+    def test_split_gist_takes_only_a_leading_line(self):
+        self.assertEqual(replies.split_gist("Yes, 22:00."), ("", "Yes, 22:00."))
+        self.assertEqual(
+            replies.split_gist("Gist: The time still works.\nYes, 22:00."),
+            ("The time still works.", "Yes, 22:00."),
+        )
+        self.assertEqual(
+            replies.split_gist("  Gist: The time still works.\nYes, 22:00."),
+            ("The time still works.", "Yes, 22:00."),
+        )
+        self.assertEqual(replies.split_gist("gist: not a gist\nYes."), ("", "gist: not a gist\nYes."))
+        self.assertEqual(replies.split_gist("Yes.\nGist: later"), ("", "Yes.\nGist: later"))
+        self.assertEqual(replies.split_gist("Gist:\nYes."), ("", "Yes."))
+        self.assertEqual(replies.split_gist("Gist: only this"), ("only this", ""))
+
+    def test_a_gist_line_in_a_block_is_the_delivered_reply_gist(self):
+        message_id, text = self.send("requested")
+        answer = (
+            f"For Sam.\n[REPLY {message_id}]\n"
+            "Gist: The time still works.\n"
+            "Yes, 22:00.\n[/REPLY]"
+        )
+        calls = self.turn(answer, prompt=text)
+        self.assertEqual(len(calls), 1)
+        call = calls[0]
+        self.assertEqual(record.get(message_id)["reply"], "Yes, 22:00.")
+        reply_row = record.get(call["message_id"])
+        self.assertEqual(reply_row["gist"], "The time still works.")
+        self.assertEqual(
+            call["text"].splitlines()[0],
+            f"Message from {MARK} Reviewer (@default): \u201cThe time still works.\u201d",
+        )
+        self.assertNotIn("Gist: The time still works", call["text"])
+        self.assertIn("Yes, 22:00.", call["text"])
+        rest = call["text"].split("\n", 1)[1]
+        self.assertTrue(rest.startswith(f"{MARK} Not Sam"))
+        self.assertEqual(reply_row["header_sha"], route.header_sha(call["text"], call["message_id"]))
+        self.assertEqual(reply_row["header_sha"], route.header_sha(rest, call["message_id"]))
+
+    def test_a_gist_line_on_the_whole_answer_is_removed_before_delivery(self):
+        message_id, text = self.send("requested")
+        calls = self.turn("Gist: The time still works.\nYes, 22:00.", prompt=text)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(record.get(message_id)["reply"], "Yes, 22:00.")
+        self.assertEqual(record.get(calls[0]["message_id"])["gist"], "The time still works.")
+        self.assertNotIn("Gist: The time still works", calls[0]["text"])
+
+    def test_a_gist_only_reply_is_silent(self):
+        message_id, text = self.send("requested")
+        self.assertEqual(self.turn(f"[REPLY {message_id}]Gist: only this[/REPLY]", prompt=text), [])
+        row = record.get(message_id)
+        self.assertEqual(row["reply_state"], "silent")
+        self.assertIsNone(row["reply"])
+        self.assertIsNone(row["reply_message_id"])
+        message_id, text = self.send("requested")
+        self.assertEqual(self.turn("Gist: only this", prompt=text), [])
+        self.assertEqual(record.get(message_id)["reply_state"], "silent")
+
+    def test_a_lowercase_gist_line_stays_in_the_body(self):
+        message_id, text = self.send("requested")
+        calls = self.turn("gist: not a gist line\nYes.", prompt=text)
+        self.assertEqual(len(calls), 1)
+        self.assertIn("gist: not a gist line", record.get(message_id)["reply"])
+        self.assertIsNone(record.get(calls[0]["message_id"])["gist"])
 
 
 if __name__ == "__main__":

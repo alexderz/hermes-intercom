@@ -20,7 +20,9 @@
    - ``optional`` (the message was a reply) and every held note (``requested='passive'``, or a
      keyed queued message handed over outside its wake's turn): the block only; with no block,
      ``no-block``. A keyed queued message in its wake's turn takes the ``requested`` branch;
-5. silence: an empty or ``[SILENT]`` text (whole, first line or last line) is ``silent``;
+5. silence: a leading ``Gist:`` line is taken off the chosen text first (block or whole answer)
+   and becomes the reply's gist; a body left empty is ``silent``, as is an empty or
+   ``[SILENT]`` text (whole, first line or last line);
 6. store, then deliver on a fresh thread through ``route.send(..., delivery="steer",
    reply_mode="optional", reply_to=id)``, into the row's ``sender_profile`` when it came from
    another profile. A peer row is posted before the unwakeable check, to ``peer:<name>``
@@ -166,6 +168,26 @@ def reply_block(answer: str, message_id: str) -> str | None:
     return None if match is None else match.group(1).strip()
 
 
+def split_gist(text: str) -> tuple[str, str]:
+    """Take a leading ``Gist:`` line off *text*. Returns ``(gist, body)``.
+
+    Only the first non-empty line, and only when it starts with ``Gist:``
+    (case-sensitive, after leading whitespace). The rest of the text is the body.
+    """
+    raw = text if isinstance(text, str) else ""
+    lines = raw.splitlines(keepends=True)
+    for index, line in enumerate(lines):
+        if not line.strip():
+            continue
+        head = line.strip()
+        if not head.startswith("Gist:"):
+            return "", raw
+        gist = head[len("Gist:"):].strip()
+        body = "".join([*lines[:index], *lines[index + 1:]]).strip()
+        return gist, body
+    return "", raw
+
+
 def is_silent(text) -> bool:
     """Empty, or ``[SILENT]`` as the whole text or its first or last line (cron's reading)."""
     lines = [line.strip() for line in str(text or "").strip().splitlines() if line.strip()]
@@ -174,12 +196,14 @@ def is_silent(text) -> bool:
     return SILENT in (lines[0].upper(), lines[-1].upper())
 
 
-def reply_for(row: dict, answer: str, *, held: bool | None = None) -> tuple[str, str | None, str | None]:
-    """Steps 4-5 for one candidate: ``(reply_state, reply text, detail)``.
+def reply_for(row: dict, answer: str, *, held: bool | None = None
+              ) -> tuple[str, str | None, str | None, str | None]:
+    """Steps 4-5 for one candidate: ``(reply_state, reply text, detail, gist)``.
 
     ``reply_state`` is ``sent`` (to be delivered or stored), ``silent``, ``stored`` or
     ``no-block``. *held* says the row rode a turn that exists for something else; by default,
-    a passive row.
+    a passive row. A leading ``Gist:`` line is removed before the silence check. A body
+    that is empty afterwards is ``silent``.
     """
     if held is None:
         held = row.get("requested") == record.PASSIVE
@@ -189,15 +213,16 @@ def reply_for(row: dict, answer: str, *, held: bool | None = None) -> tuple[str,
         # agent's row is block only too: Bot Chat's answer is for its user, and only the
         # block goes back.
         if row["reply_mode"] == "optional" or held or row.get("sender_source") == route.PEER_SOURCE:
-            return "no-block", None, None
+            return "no-block", None, None, None
         if _shared_sender(row):
-            return "stored", None, "shared-chat-no-block"
+            return "stored", None, "shared-chat-no-block", None
         text = answer.strip()
     else:
         text = block
+    gist, text = split_gist(text)
     if is_silent(text):
-        return "silent", None, None
-    return "sent", text, None
+        return "silent", None, None, None
+    return "sent", text, None, gist or None
 
 
 def _is_candidate(row: dict, lineage: set) -> bool:
@@ -218,7 +243,7 @@ def _unwakeable(row: dict) -> bool:
 
 
 def _answer(row: dict, answer: str, session_id: str, *, held: bool | None = None) -> None:
-    state, text, detail = reply_for(row, answer, held=held)
+    state, text, detail, gist = reply_for(row, answer, held=held)
     now = time.time()
     # A peer has no session to wake, but the block still goes to its webhook. That branch
     # is before the unwakeable downgrade, which would otherwise store the reply and stop.
@@ -233,20 +258,20 @@ def _answer(row: dict, answer: str, session_id: str, *, held: bool | None = None
     if state != "sent":
         return
     run = contextvars.copy_context().run
-    threading.Thread(target=run, args=(_deliver, row, text, session_id), daemon=True,
+    threading.Thread(target=run, args=(_deliver, row, text, session_id, gist), daemon=True,
                      name=f"intercom-reply-{row['id']}").start()
 
 
-def _deliver(row: dict, text: str, session_id: str) -> None:
+def _deliver(row: dict, text: str, session_id: str, gist=None) -> None:
     try:
         if row.get("sender_source") == route.PEER_SOURCE:
             receipt = route.send(session_id, f"peer:{row.get('sender_label') or ''}", text,
                                  ctx=_ctx["ctx"], delivery="steer", reply_mode="optional",
-                                 reply_to=row["id"])
+                                 reply_to=row["id"], gist=gist)
         else:
             receipt = route.send(session_id, row["sender_session_id"], text, ctx=_ctx["ctx"],
                                  delivery="steer", reply_mode="optional", reply_to=row["id"],
-                                 profile=row.get("sender_profile"))
+                                 profile=row.get("sender_profile"), gist=gist)
     except Exception as exc:  # health: allow BLE001 -- log the type only; the reply text can be in the traceback
         logger.warning("intercom: reply to message %s failed (%s)", row["id"], type(exc).__name__)
         return
@@ -282,7 +307,7 @@ def ask(args: dict, *, session_id=None, ctx=None, lister=None, **_kw) -> dict:
     receipt = route.send(session_id, args.get("to"), args.get("message"), ctx=ctx,
                          delivery=args.get("delivery") or "steer", reply_mode="waiting",
                          kind="ask", lister=lister, on_inserted=on_inserted, key=args.get("key"),
-                         profile=args.get("profile"))
+                         profile=args.get("profile"), gist=args.get("gist"))
     message_id = receipt.get("message_id")
     if receipt.get("ok") is not True:
         _drop(message_id)

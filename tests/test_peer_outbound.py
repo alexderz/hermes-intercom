@@ -728,6 +728,16 @@ class PostTests(OutboundTestBase):
         self.assertEqual(row["sender_session_id"], BOT)
         self.assert_clean(receipt)
 
+    def test_a_gist_is_stored_and_not_posted(self):
+        receipt = self.send("café from bot chat", gist="A note for the remote agent.")
+        self.assertTrue(receipt["ok"], receipt)
+        payload = json.loads(self.server.seen[-1]["body"])
+        self.assertEqual(list(payload), ["from", "message_id", "wants_reply", "text"])
+        self.assertNotIn("gist", payload)
+        self.assertEqual(payload["text"], "café from bot chat")
+        self.assertEqual(record.get(receipt["message_id"])["gist"], "A note for the remote agent.")
+        self.assert_clean(receipt)
+
     def test_none_posts_wants_reply_false_and_omits_reply_to(self):
         receipt = self.send("a note", reply_mode="none")
         self.assertTrue(receipt["ok"], receipt)
@@ -1128,8 +1138,8 @@ class ReplyTests(OutboundTestBase):
         self.assertEqual(inbound["reply_mode"], "requested")
         self.assertEqual(inbound["sender_source"], "peer")
         framed = self.owner.calls[-1]["text"]
-        state, text, detail = replies.reply_for(inbound, "Yes, 22:00 still holds.")
-        self.assertEqual((state, text, detail), ("no-block", None, None))
+        state, text, detail, gist = replies.reply_for(inbound, "Yes, 22:00 still holds.")
+        self.assertEqual((state, text, detail, gist), ("no-block", None, None, None))
         self.turn("Yes, 22:00 still holds.", prompt=framed)
         self.assertEqual(self.server.seen, [])
         self.assertEqual(record.get(inbound["id"])["reply_state"], "no-block")

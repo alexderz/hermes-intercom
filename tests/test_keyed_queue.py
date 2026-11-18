@@ -216,6 +216,18 @@ class WakeTests(KeyedQueueTestBase):
         self.assertIsNone(self.turn())
         self.assertEqual(len(self.owner.wakes()), 1)
 
+    def test_a_wake_uses_the_wake_line_fallback_not_the_stored_gist(self):
+        receipt = self.send("build state: verifying G3", gist="The build is ready to merge.")
+        wake = self.owner.wakes()[0]["text"]
+        line = "keyed update `build-state` from `status-script`; the current version follows."
+        self.assertEqual(wake.splitlines()[0], f"Message from {MARK} status-script: \u201c{line}\u201d")
+        self.assertNotIn("ready to merge", wake)
+        row = record.get(receipt["message_id"])
+        self.assertEqual(row["gist"], "The build is ready to merge.")
+        stored = route.frame_stored(row, self.ctx)
+        self.assertTrue(stored.splitlines()[0].endswith("\u201cThe build is ready to merge.\u201d"))
+        self.assertIn("build state: verifying G3", stored)
+
     def test_the_wake_records_its_span_hash_and_marker_on_the_submitting_row(self):
         first = self.send()
         second = self.send("newer")

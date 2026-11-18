@@ -368,6 +368,15 @@ class SweepTests(DeadlineTestBase):
         self.assertIsNotNone(row["wake_claimed_at"])
         self.assertEqual(row["result"], "pending")
 
+    def test_a_wake_uses_the_wake_line_not_the_stored_gist(self):
+        receipt = self.held(gist="The nightly check passed.")
+        self.sweep(receipt)
+        wake = self.owner.wakes()[0]["text"]
+        line = "a held note from `status-script` is due; it follows."
+        self.assertEqual(wake.splitlines()[0], f"Message from {MARK} status-script: \u201c{line}\u201d")
+        self.assertNotIn("nightly check", wake)
+        self.assertEqual(record.get(receipt["message_id"])["gist"], "The nightly check passed.")
+
     def test_reply_mode_none_on_the_wake_line(self):
         receipt = self.held(sender="local-sender", script=False, reply_mode="requested")
         with mock.patch.object(deadline.route.frame, "build", wraps=frame.build) as build:

@@ -316,7 +316,7 @@ class FrameTest(PeerTestBase):
         row = self.rows()[-1]
         mid = row["id"]
         lines = text.splitlines()
-        self.assertEqual(lines[0], f"Message from {MARK} remote-bot:")
+        self.assertEqual(lines[0], f"Message from {MARK} remote-bot: \u201cplease look\u201d")
         self.assertEqual(lines[1], f"{MARK} Not Sam · reply requested · remote agent remote-bot "
                                    f"says (message {mid}):")
         self.assertEqual(lines[2], "Message from a remote agent, remote-bot, not from Sam (the user). "

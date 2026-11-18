@@ -24,7 +24,9 @@
   target) or ``queued`` (replaceable, with the key); ``held`` when the owner did not take the
   wake, so the row rides the target's next turn;
 - 5 ``frame.build``, ``sanitize_user_prompt_text`` once, then ``header_sha`` over the span from
-  header line 1 to the closing line, stored in the row;
+  header line 1 to the closing line, stored in the row. An explicit gist is cleaned and stored
+  on the row and quoted on the notice line; a wake line passes none, so that line uses the
+  fallback. The span below the notice line does not include the gist;
 - 6 ``client.deliver_sync``;
 - 7 ``record.update`` and the receipt.
 
@@ -146,7 +148,7 @@ def cold_start_sentence(title: str, message_id: str) -> str:
 
 def send(sender, to, message, *, ctx, delivery="steer", reply_mode=None, kind="send",
          reply_to=None, script=False, lister=None, on_inserted=None, key=None,
-         profile=None, within=None, peer=None) -> dict:
+         profile=None, within=None, peer=None, gist=None) -> dict:
     """Send *message* from *sender* to the one session *to* resolves to. Returns the receipt.
 
     *sender* is the calling session's id, or with ``script=True`` a script label (the CLI, which
@@ -160,6 +162,9 @@ def send(sender, to, message, *, ctx, delivery="steer", reply_mode=None, kind="s
     the note is still held. *peer* names the remote agent a webhook post came from; *sender* is
     then None. A ``to`` of ``peer:<name>`` is an outbound post to that remote agent
     (``peers.send``); it is decided after the reply-mode check and does not resolve a session.
+    *gist* is an optional sentence for the owner. The cleaned text is stored; the notice line
+    shows it, or the first sentence of the body when it is absent. A peer post stores it and
+    does not send it.
     """
     passive = delivery == PASSIVE
     if not passive and delivery not in client.DELIVERIES:
@@ -181,7 +186,7 @@ def send(sender, to, message, *, ctx, delivery="steer", reply_mode=None, kind="s
             import peers
         return peers.send(sender, peer_to, message, delivery=delivery, reply_mode=reply_mode,
                           kind=kind, reply_to=reply_to, script=script, key=key, profile=profile,
-                          within=within)
+                          within=within, gist=gist)
     profile = profiles.other(profile)
     usage = _usage_error(delivery, key, to_all, reply_mode, kind, profile=profile, to=to,
                          within=within)
@@ -204,7 +209,7 @@ def send(sender, to, message, *, ctx, delivery="steer", reply_mode=None, kind="s
     row = dict(message_id=message_id, kind=kind, sender_label=who.label, sender_source=who.source,
                sender_session_id=who.session_id, address=to if isinstance(to, str) else "",
                body=body, reply_mode=reply_mode, requested=delivery, in_reply_to=reply_to,
-               note_key=key)
+               note_key=key, gist=frame.clean_gist(gist) or None)
     if within is not None:
         row["created_at"] = time.time()
         row["wake_at"] = row["created_at"] + _minutes(within) * 60
@@ -297,7 +302,7 @@ def _steps(receipt, row, who, *, sender, to, ctx, delivery, reply_mode, kind, re
     # 5. frame, sanitise once, hash the span
     text = _framed(message_id, who, body, ctx=ctx, reply_mode=reply_mode,
                    interrupt=delivery == "interrupt", kind=kind, reply_to=reply_to,
-                   scopes=(sender_scope, target, target_scope, title))
+                   scopes=(sender_scope, target, target_scope, title), gist=row.get("gist"))
     record.update(message_id, header_sha=header_sha(text, message_id))
 
     # 6. deliver through the owner
@@ -327,6 +332,8 @@ def frame_stored(row: dict, ctx, *, body=None, reply_mode=None) -> str:
 
     For a keyed queued message handed over in its wake's turn: that turn exists for it. With
     *body* and *reply_mode*, another text framed as this row (a deadline note's wake line).
+    The row's gist is used only when *body* is omitted (the newest keyed version). A wake
+    line passes none, so its notice line is the fallback of that line.
     """
     if row.get("sender_source") == PEER_SOURCE:
         who = _Who.peer(row.get("sender_label"))
@@ -338,9 +345,12 @@ def frame_stored(row: dict, ctx, *, body=None, reply_mode=None) -> str:
         who = _Who.session(row["sender_session_id"])
     sender_scope = None if who.kind in ("script", "peer") else row.get("sender_chat_scope")
     text = (row.get("body") or "") if body is None else body
+    # A wake line (body given) must not reuse a gist written for an older version.
+    shown_gist = row.get("gist") if body is None else None
     return _framed(row["id"], who, text, ctx=ctx, reply_mode=reply_mode or row["reply_mode"],
                    scopes=(sender_scope, row.get("target_session_id"), row.get("target_chat_scope"),
-                           row.get("target_title") or row.get("target_session_id")))
+                           row.get("target_title") or row.get("target_session_id")),
+                   gist=shown_gist)
 
 
 def injection_allowed() -> bool:
@@ -424,7 +434,7 @@ def wake_clock(stamp) -> str:
 
 
 def _framed(message_id, who, body, *, ctx, reply_mode, scopes, interrupt=False, kind="send",
-            reply_to=None) -> str:
+            reply_to=None, gist=None) -> str:
     """Step 5's frame, sanitised once. *scopes* is (sender scope, target, target scope, title)."""
     sender_scope, target, target_scope, title = scopes
     target_facts = _facts(target)
@@ -435,6 +445,7 @@ def _framed(message_id, who, body, *, ctx, reply_mode, scopes, interrupt=False, 
         sender_scope=None if who.kind in ("script", "peer") else frame.Scope(sender_scope, who.platform,
                                                                     who.chat_type, who.title),
         target_scope=frame.Scope(target_scope, target_facts["platform"], target_facts["chat_type"], title),
+        gist=gist,
     )
     from hermes_cli.input_sanitize import sanitize_user_prompt_text
 

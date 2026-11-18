@@ -120,7 +120,8 @@ CREATE TABLE IF NOT EXISTS messages (
   wake_at REAL,
   wake_claimed_at REAL,
   wake_turn TEXT,
-  woken_at REAL
+  woken_at REAL,
+  gist TEXT
 )
 """
 
@@ -135,6 +136,7 @@ _ADDED_COLUMNS = (
     ("wake_claimed_at", "REAL"),
     ("wake_turn", "TEXT"),
     ("woken_at", "REAL"),
+    ("gist", "TEXT"),
 )
 
 # Its own statement: conn.execute runs one statement only.
@@ -209,8 +211,12 @@ def insert(
     note_key: str | None = None,
     sender_profile: str | None = None,
     wake_at: float | None = None,
+    gist: str | None = None,
 ) -> None:
     """Insert the row before delivery. ``result`` and ``header_sha`` stay empty.
+
+    ``gist`` is the cleaned explicit gist, or ``None`` when the notice line used
+    the first-sentence fallback.
 
     A ``reply_mode`` outside the four values fails the table check
     (``sqlite3.IntegrityError``).
@@ -580,6 +586,7 @@ _INSERT_COLUMNS = (
     "target_session_id", "target_title", "address", "body", "sender_chat_scope",
     "target_chat_scope", "reply_mode", "requested", "request_id", "created_at",
     "note_key", "sender_profile", "wake_admission", "wake_instance", "wake_at",
+    "gist",
 )
 
 

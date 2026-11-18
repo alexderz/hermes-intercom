@@ -103,6 +103,8 @@ def register_parser(parser: argparse.ArgumentParser) -> None:
     send.add_argument("--to", required=True,
                       help="Session id, exact title, Home, @<project>, or all (passive with a key).")
     send.add_argument("--message", default=None, help="Message text.")
+    send.add_argument("--gist", default=None,
+                      help="One plain sentence for the owner: what this message is about.")
     send.add_argument("--file", default=None, help="Read the message from PATH, or - for stdin.")
     send.add_argument("--reply", choices=("none", "requested", "waiting"), default="none",
                       help="none (default), requested, or waiting.")
@@ -256,6 +258,7 @@ def _cmd_send(args) -> int:
         script=True,
         key=args.key,
         within=args.within,
+        gist=args.gist,
     )
     if args.json:
         print(json.dumps(receipt, ensure_ascii=False))
