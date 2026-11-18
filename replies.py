@@ -258,6 +258,7 @@ def _answer(row: dict, answer: str, session_id: str, *, held: bool | None = None
     if state != "sent":
         return
     run = contextvars.copy_context().run
+    # health: allow HX012 -- the target is contextvars.copy_context().run, so the thread keeps the caller's profile scope
     threading.Thread(target=run, args=(_deliver, row, text, session_id, gist), daemon=True,
                      name=f"intercom-reply-{row['id']}").start()
 
