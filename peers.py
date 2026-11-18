@@ -102,7 +102,7 @@ def for_bot_chat(sender) -> list[dict] | None:
 
 
 def send(sender, to, message, *, delivery="steer", reply_mode=None, kind="send", reply_to=None,
-         script=False, key=None, profile=None, within=None) -> dict:
+         script=False, key=None, profile=None, within=None, gist=None) -> dict:
     """POST *message* to the remote agent *to* (``peer:<name>``). The receipt is the return value.
 
     The first step refuses, with nothing recorded or posted, unless every one of these holds:
@@ -114,7 +114,7 @@ def send(sender, to, message, *, delivery="steer", reply_mode=None, kind="send",
     is refused. A reply (``optional``, with ``reply_to``) posts ``wants_reply: false``. The row
     is recorded before the POST. TLS is verified, redirects are not followed, and the secret
     (the URL, the HMAC key, or the bearer key) is never put in the receipt, the record, the
-    log, an exception message, or a repr.
+    log, an exception message, or a repr. *gist* is stored on the row and is not posted.
     """
     text = to.strip() if isinstance(to, str) else ""
     reply_to = reply_to or None
@@ -128,7 +128,8 @@ def send(sender, to, message, *, delivery="steer", reply_mode=None, kind="send",
     body = message if isinstance(message, str) else ""
     wants_reply = reply_mode == "requested"
     if not body.strip():
-        return _empty(sender, peer, body, delivery=delivery, reply_mode=reply_mode, reply_to=reply_to)
+        return _empty(sender, peer, body, delivery=delivery, reply_mode=reply_mode,
+                      reply_to=reply_to, gist=gist)
 
     target = _target(peer)
     if target is None:
@@ -139,7 +140,8 @@ def send(sender, to, message, *, delivery="steer", reply_mode=None, kind="send",
 
     message_id = secrets.token_hex(4)
     raw = _payload(message_id, body, wants_reply=wants_reply, reply_to=reply_to)
-    _record(sender, peer, message_id, body, delivery=delivery, reply_mode=reply_mode, reply_to=reply_to)
+    _record(sender, peer, message_id, body, delivery=delivery, reply_mode=reply_mode,
+            reply_to=reply_to, gist=gist)
     headers = {"Content-Type": "application/json"}
     if signing_key is not None:
         stamp = str(int(time.time()))
@@ -260,7 +262,7 @@ def _who(sender: str):
     return route._Who.session(sender)
 
 
-def _empty(sender, peer: Peer, body: str, *, delivery, reply_mode, reply_to) -> dict:
+def _empty(sender, peer: Peer, body: str, *, delivery, reply_mode, reply_to, gist=None) -> dict:
     """An empty message is refused like any other send: one refused row, nothing posted."""
     try:
         from . import record, route
@@ -269,7 +271,8 @@ def _empty(sender, peer: Peer, body: str, *, delivery, reply_mode, reply_to) -> 
         import route
 
     message_id = secrets.token_hex(4)
-    _record(sender, peer, message_id, body, delivery=delivery, reply_mode=reply_mode, reply_to=reply_to)
+    _record(sender, peer, message_id, body, delivery=delivery, reply_mode=reply_mode,
+            reply_to=reply_to, gist=gist)
     record.update(message_id, delivery_path="refused", result="refused", detail="empty")
     fields = _fields(ok=False, receipt="refused", to=f"{PREFIX}{peer.name}", message_id=message_id,
                      title=peer.name, delivery=delivery, reply_mode=reply_mode,
@@ -324,18 +327,23 @@ def _payload(message_id: str, text: str, *, wants_reply: bool, reply_to) -> byte
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
 
-def _record(sender, peer: Peer, message_id: str, body: str, *, delivery, reply_mode, reply_to) -> None:
-    """The row, with ``delivery_path='peer'``, before the POST."""
+def _record(sender, peer: Peer, message_id: str, body: str, *, delivery, reply_mode, reply_to,
+            gist=None) -> None:
+    """The row, with ``delivery_path='peer'``, before the POST.
+
+    *gist* is cleaned and stored. It is not part of the posted JSON.
+    """
     try:
-        from . import record
+        from . import frame, record
     except ImportError:
+        import frame
         import record
 
     who = _who(sender)
     record.insert(message_id, kind="send", sender_label=who.label, sender_source=who.source,
                   sender_session_id=who.session_id, address=f"{PREFIX}{peer.name}", body=body,
                   reply_mode=reply_mode, requested=delivery, target_title=peer.name,
-                  in_reply_to=reply_to)
+                  in_reply_to=reply_to, gist=frame.clean_gist(gist) or None)
     record.update(message_id, delivery_path="peer")
 
 

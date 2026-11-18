@@ -168,6 +168,14 @@ def _schema(projects: bool, user_name: str = "the user") -> dict:
                     "type": "string",
                     "description": "The text. Never send an empty message.",
                 },
+                "gist": {
+                    "type": "string",
+                    "description": (
+                        "One plain sentence for the owner, not for the recipient: what this message "
+                        "is about. No ids, paths or jargon. Example: 'Third review round passed; the "
+                        "harness is ready to merge.' For send and ask."
+                    ),
+                },
                 "delivery": {
                     "type": "string",
                     "enum": ["interrupt", "steer", "queue", "passive"],
@@ -278,6 +286,7 @@ def _owner_dispatch(args: dict, **kw) -> dict:
                 key=args.get("key"),
                 profile=args.get("profile"),
                 within=args.get("within"),
+                gist=args.get("gist"),
             )
         except ValueError as exc:
             return {"ok": False, "error": "usage", "exit": 2, "message": str(exc)}

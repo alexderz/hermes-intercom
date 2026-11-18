@@ -279,8 +279,14 @@ class SchemaTests(CliTestBase):
         self.assertEqual(props["delivery"]["enum"], ["interrupt", "steer", "queue", "passive"])
         self.assertEqual(props["delivery"]["default"], "steer")
         self.assertIn(INTERRUPT, props["delivery"]["description"])
-        for name in ("include_runs", "query", "limit", "timeout", "request_id", "to", "message"):
+        for name in ("include_runs", "query", "limit", "timeout", "request_id", "to", "message", "gist"):
             self.assertIn(name, props)
+        self.assertEqual(
+            props["gist"]["description"],
+            "One plain sentence for the owner, not for the recipient: what this message is about. "
+            "No ids, paths or jargon. Example: 'Third review round passed; the harness is ready to merge.' "
+            "For send and ask.",
+        )
         self.assertIs(props["include_runs"]["default"], False)
         self.assertEqual(props["limit"]["default"], 30)
         self.assertIn("600", props["timeout"]["description"])
@@ -340,6 +346,7 @@ class SchemaTests(CliTestBase):
         code, out, err = self.invoke(["send", "--help"])
         self.assertEqual(code, 0, err)
         self.assertIn(INTERRUPT, out)
+        self.assertIn("--gist", out)
 
 
 class ToolDispatchTests(CliTestBase):
@@ -367,6 +374,37 @@ class ToolDispatchTests(CliTestBase):
         self.assertEqual(body["reply"], "none")
         self.assertEqual(len(self.record_rows()), 1)
         self.assertIn("hermes@", self.owner.calls[0]["text"])
+
+    def test_send_stores_the_gist(self):
+        self.sessions()
+        raw = self.plugin.handle(
+            {"action": "send", "to": "local-target", "message": "hello", "reply": "none",
+             "gist": "A short note for the owner."},
+            session_id="local-sender",
+        )
+        body = json.loads(raw)
+        self.assertTrue(body["ok"], body)
+        self.assertEqual(self.record_rows()[0]["gist"], "A short note for the owner.")
+        self.assertIn("\u201cA short note for the owner.\u201d", self.owner.calls[0]["text"].splitlines()[0])
+
+    def test_ask_passes_the_gist_and_reply_does_not(self):
+        self.sessions()
+        with mock.patch.object(self.plugin.route, "send",
+                               return_value={"ok": False, "error": "injection-off"}) as send:
+            self.plugin.handle(
+                {"action": "ask", "to": "local-target", "message": "Is it tonight?",
+                 "gist": "Asking about the window."},
+                session_id="local-sender",
+            )
+        self.assertEqual(send.call_args.kwargs["gist"], "Asking about the window.")
+        self.assertEqual(send.call_args.kwargs["kind"], "ask")
+        send.reset_mock()
+        self.plugin.handle(
+            {"action": "reply", "to": "local-target", "request_id": "abcd1234",
+             "message": "yes", "gist": "should be ignored"},
+            session_id="local-target",
+        )
+        send.assert_not_called()
 
     def test_ask_and_reply_dispatch_to_the_waiter(self):
         self.sessions()
@@ -533,6 +571,19 @@ class SendTests(CliTestBase):
         self.assertIn("hermes@script cli", text)
         self.assertIn("no reply needed", text)
         self.assertEqual(self.owner.calls[0]["delivery"], "steer")
+
+    def test_gist_is_stored_from_the_flag(self):
+        code, _out, err = self.invoke([
+            "send", "--to", "local-target", "--message", "Backup finished.",
+            "--gist", "The nightly backup finished cleanly.",
+        ])
+        self.assertEqual(code, 0, err)
+        row = self.record_rows()[0]
+        self.assertEqual(row["gist"], "The nightly backup finished cleanly.")
+        self.assertEqual(
+            self.owner.calls[0]["text"].splitlines()[0],
+            "Message from \U0001f4e1 cli: \u201cThe nightly backup finished cleanly.\u201d",
+        )
 
     def test_no_reply_and_other_usage_errors_exit_2(self):
         cases = [

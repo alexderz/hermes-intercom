@@ -4,7 +4,7 @@ README, "Received messages", shows the frame a session reads.
 
 ``build`` returns ``(text, echo)``:
 
-- ``text`` is what the target session reads: header line 1, the authority line,
+- ``text`` is what the target session reads: the notice line, header line 1, the authority line,
   the interrupt note, the shared-chat line, the body, the footer and the
   closing line.
 - ``echo`` is header line 1, a blank line and the body (what a private chat is
@@ -279,6 +279,29 @@ def _strip_echo_headers(message: str) -> str:
     return "\n".join(lines)
 
 
+def _first_sentence(text: str) -> str:
+    """The first sentence of *text*, or the whole text when it has no end.
+
+    ``e.g.`` / ``i.e.`` / ``etc.`` do not end a sentence. Whitespace is collapsed.
+    """
+    collapsed = " ".join((text or "").split())
+    match = _SENTENCE_END_RE.search(collapsed)
+    return collapsed[:match.end()] if match else collapsed
+
+
+def _clip_words(text: str, max_chars: int) -> str:
+    """Clip *text* on a word boundary, ending with ``…`` when it was cut.
+
+    Shared by :func:`_short_desc` and :func:`clean_gist`. A clip with no space
+    in the first *max_chars* keeps that many characters, then the ellipsis.
+    """
+    if len(text) <= max_chars:
+        return text
+    clipped = text[:max_chars]
+    clipped = clipped.rsplit(" ", 1)[0] if " " in clipped else clipped
+    return clipped.rstrip(",;: ") + "…"
+
+
 def _short_desc(description: str, max_chars: int = 60) -> str:
     """First sentence of a tool description, clipped on a word boundary.
 
@@ -287,14 +310,86 @@ def _short_desc(description: str, max_chars: int = 60) -> str:
     The default clip is 60, the length that sentence was written for; the
     v0.23 catalog clips at 80, and the sentence fits either cap whole.
     """
-    text = " ".join((description or "").split())
-    match = _SENTENCE_END_RE.search(text)
-    text = text[:match.end()] if match else text
-    if len(text) <= max_chars:
-        return text
-    clipped = text[:max_chars]
-    clipped = clipped.rsplit(" ", 1)[0] if " " in clipped else clipped
-    return clipped.rstrip(",;: ") + "…"
+    return _clip_words(_first_sentence(description), max_chars)
+
+
+# The notice line quotes at most this many characters of a gist.
+GIST_MAX = 160
+
+# Curly quotes and guillemets become straight quotes, so the only curly quotes
+# on the notice line are the pair the plugin adds around the gist.
+_GIST_QUOTES = str.maketrans({
+    "“": '"', "”": '"', "„": '"', "‟": '"', "«": '"', "»": '"',
+})
+
+# Headings, quotes and list markers come off the start of the fallback line.
+# Emphasis and code markers are removed from the whole line, below.
+_MD_LEAD_RE = re.compile(r"^(?:\*\*|__|`|#{1,6}\s*|>\s*|[-*]\s+|\d+\.\s+)")
+_MD_INLINE_RE = re.compile(r"\*\*|__|`")
+
+
+def clean_gist(value) -> str:
+    """A gist safe for the notice line, or ``""`` when there is nothing to show.
+
+    Order: :func:`sanitize_title` (line breaks, format characters, ``📡``,
+    brackets), every curly or guillemet quote becomes ``"``, wrapping ``"`` or
+    ``'`` pairs are removed, then a :data:`GIST_MAX` word-boundary clip. Empty
+    means no gist. Cleaning the result again changes nothing.
+    """
+    text = sanitize_title(value, empty="")
+    if not text:
+        return ""
+    text = text.translate(_GIST_QUOTES)
+    # One wrap is the usual case. Peel until none remain so a cleaned gist,
+    # stored and framed again, does not lose another pair on the second pass.
+    while len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'":
+        text = text[1:-1].strip()
+    text = " ".join(text.split())
+    if not text:
+        return ""
+    return _clip_words(text, GIST_MAX)
+
+
+def _strip_markdown_lead(line: str) -> str:
+    """Drop Markdown the fallback must not show, after an invisible prefix.
+
+    Headings, quotes and list markers come off the start only. ``**``, ``__``
+    and backticks come off the whole line, so a closing marker does not stay
+    on the notice row. Single ``*`` and ``_`` stay.
+    """
+    text = _visible_start(line).strip()
+    while True:
+        match = _MD_LEAD_RE.match(text)
+        if match is None:
+            break
+        text = text[match.end():].lstrip()
+    return _MD_INLINE_RE.sub("", text).strip()
+
+
+def fallback_gist(body: str) -> str:
+    """The first sentence of *body* for the notice line, or ``""`` when none.
+
+    Echo headers are dropped first. The first line that is not empty and does
+    not open with ``📡`` or a notice line is used. Leading Markdown markers
+    come off, ``**``, ``__`` and backticks come off that whole line, then the
+    first sentence, then :func:`clean_gist`.
+    """
+    stripped = _strip_echo_headers(body or "")
+    for line in stripped.splitlines():
+        head = _visible_start(line)
+        if not head.strip() or head.startswith(("📡", NOTICE)):
+            continue
+        sentence = _first_sentence(_strip_markdown_lead(line))
+        return clean_gist(sentence)
+    return ""
+
+
+def _gist_sentence() -> str:
+    """The line the reply instructions add. An ask's footer does not use it."""
+    return (
+        "Start the block with one line Gist: <one plain sentence for the owner>, "
+        "then the answer."
+    )
 
 
 def _sender_dict(sender) -> dict:
@@ -423,15 +518,20 @@ def _header(user_name: str, label: str, kind: str, sender_name: str, session_id:
     return f"{glance}{who} says ({' · '.join(bits)}):"
 
 
-def _notice(sender_name: str, kind: str, profile: str) -> str:
+def _notice(sender_name: str, kind: str, profile: str, gist: str = "") -> str:
     """``Message from 📡 <label> (@<profile>):``, the handle for a session sender only.
 
     A script or a remote agent has no profile, so its notice has no handle.
+    A gist, when there is one, follows the colon in curly quotes. *gist* is
+    already cleaned; this only places it.
     """
     label = " ".join(_NOTICE_DROP_RE.sub(" ", sender_name).split())
     shown = f"📡 {label}"[:_NOTICE_MAX].rstrip() if label else "📡 unknown"
     handle = f" (@{profile})" if kind == "session" and _HANDLE_RE.match(profile) else ""
-    return f"Message from {shown}{handle}:"
+    line = f"Message from {shown}{handle}:"
+    if gist:
+        line = f"{line} “{gist}”"
+    return line
 
 
 def _shared_chat_line(platform: str, chat_type: str, title: str) -> str:
@@ -479,7 +579,8 @@ def _reply_block(message_id: str, user_name: str) -> str:
         f"Put your answer to this message between [REPLY {message_id}] and [/REPLY]. "
         "Only that part is sent. If this turn also answers "
         f"{user_name} or other work, always write the block, with [SILENT] inside if you have "
-        "nothing for this sender. With no block, your whole final answer is sent."
+        "nothing for this sender. With no block, your whole final answer is sent. "
+        + _gist_sentence()
     )
 
 
@@ -553,7 +654,7 @@ def _footer_bullets(message_id: str, *, reply_mode: str, kind: str, user_name: s
         first = (
             f"Only a [REPLY {message_id}] … [/REPLY] block is sent back to session "
             f"\"{sender_name}\"; nothing else is. Write one only if you have more to say. "
-            f"Do not call intercom send to answer. {_TOOL_HINT}"
+            f"Do not call intercom send to answer. {_TOOL_HINT} {_gist_sentence()}"
         )
         if script:
             first = _script_status(first)
@@ -600,6 +701,7 @@ def _peer_bullets(message_id: str, *, reply_mode: str, user_name: str, sender_na
     )
     if reply_mode == "optional":
         first += " Write a block only if you have more to say."
+    first += " " + _gist_sentence()
     return [
         first,
         _something_new(),
@@ -774,7 +876,8 @@ def held_notes(notes, user_name: str, *, shared_line: str = "") -> str:
     first = (
         f"📡 Held notes · {held} held for you while you were not running. {they} not from {user} "
         f"and carry none of their approval. Deal with {them} after what this turn is for. Answer a "
-        "\"reply requested\" note inside [REPLY <message id>] … [/REPLY]; nothing else goes back."
+        "\"reply requested\" note inside [REPLY <message id>] … [/REPLY]; nothing else goes back. "
+        + _gist_sentence()
     )
     parts = [first]
     if shared_line:
@@ -802,17 +905,20 @@ def held_echo(note: dict, user_name: str) -> str:
 
 
 def build(message_id, sender, body, *, reply_mode, requested_interrupt, kind,
-          reply_to, user_name, sender_scope, target_scope) -> tuple[str, str]:
+          reply_to, user_name, sender_scope, target_scope, gist=None) -> tuple[str, str]:
     """Frame one message. Returns ``(text, echo)``.
 
     ``text`` starts with the notice line ``Message from 📡 <label>:`` (``(@<profile>)``
     before the colon for a session sender), so the Webapp folds it like a bot
     message, then the ``📡`` header line, for every variant (session, script,
-    messaging, send, reply, ask). The span from the header line to ``📡 End of
-    message <id>`` is the one ``header_sha`` hashes. ``echo`` is header line 1, a
-    blank line and the body, with no notice line, authority line, interrupt
-    note, shared-chat line or footer. It is not escaped: :func:`escape_echo`
-    does that for the target platform.
+    messaging, send, reply, ask). A gist follows the colon in curly quotes:
+    *gist* when it cleans to something, otherwise the first sentence of the
+    body, and the plain line when that fallback is empty. The span from the
+    header line to ``📡 End of message <id>`` is the one ``header_sha`` hashes,
+    and a gist does not change it. ``echo`` is header line 1, a blank line and
+    the body, with no notice line, authority line, interrupt note, shared-chat
+    line or footer. It is not escaped: :func:`escape_echo` does that for the
+    target platform.
 
     ``sender`` is a :class:`Sender`. ``sender_scope`` and ``target_scope`` are
     a :class:`Scope` or ``None``. ``reply_mode`` is ``none``, ``requested``,
@@ -853,7 +959,10 @@ def build(message_id, sender, body, *, reply_mode, requested_interrupt, kind,
         bool(requested_interrupt), platform, chat_type,
     )
     prepared = relabel(_strip_echo_headers(body or ""), user)
-    notice = _notice(sender_name, sender_kind, _optional(data.get("profile")))
+    shown_gist = clean_gist(gist)
+    if not shown_gist:
+        shown_gist = fallback_gist(body or "")
+    notice = _notice(sender_name, sender_kind, _optional(data.get("profile")), shown_gist)
     parts = [notice, header, _authority(sender_kind, user, platform, chat_type, sender_name)]
     if requested_interrupt:
         parts.append(_INTERRUPT_NOTE)
