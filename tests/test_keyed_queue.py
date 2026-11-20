@@ -203,8 +203,14 @@ class WakeTests(KeyedQueueTestBase):
         self.assertEqual(wake["submission_id"], f"intercom-{first['message_id']}")
         self.assertIn("keyed update `build-state` from `status-script`; the current version follows.",
                       wake["text"])
-        self.assertNotIn("verifying", wake["text"])
-        self.assertNotIn("landed", wake["text"])
+        # The notice line shows the version current when the wake went out (accepted trade-off);
+        # the wake body itself carries no version, the turn gets the newest one.
+        body = "\n".join(wake["text"].splitlines()[1:])
+        self.assertNotIn("verifying", body)
+        self.assertNotIn("landed", body)
+        first_line = wake["text"].splitlines()[0]
+        self.assertIn("verifying G3", first_line)
+        self.assertNotIn("landed", first_line)
         context = self.wake_turn()
         self.assertIn("build state: G3 landed", context)
         self.assertNotIn("verifying G3", context)
@@ -216,22 +222,34 @@ class WakeTests(KeyedQueueTestBase):
         self.assertIsNone(self.turn())
         self.assertEqual(len(self.owner.wakes()), 1)
 
-    def test_a_wake_uses_the_wake_line_fallback_not_the_stored_gist(self):
+    def test_a_wake_shows_this_versions_gist_not_the_wake_line(self):
         receipt = self.send("build state: verifying G3", gist="The build is ready to merge.")
         wake = self.owner.wakes()[0]["text"]
-        # The wake body keeps its backticks. The notice line is the fallback, which strips them.
-        line = "keyed update build-state from status-script; the current version follows."
-        self.assertEqual(wake.splitlines()[0], f"Message from {MARK} status-script: \u201c{line}\u201d")
+        self.assertEqual(wake.splitlines()[0],
+                         f"Message from {MARK} status-script: \u201cThe build is ready to merge.\u201d")
+        # The wake body still carries the wake line; the current version follows at its turn.
         self.assertIn(
             "keyed update `build-state` from `status-script`; the current version follows.",
             "\n".join(wake.splitlines()[1:]),
         )
-        self.assertNotIn("ready to merge", wake)
         row = record.get(receipt["message_id"])
         self.assertEqual(row["gist"], "The build is ready to merge.")
         stored = route.frame_stored(row, self.ctx)
         self.assertTrue(stored.splitlines()[0].endswith("\u201cThe build is ready to merge.\u201d"))
         self.assertIn("build state: verifying G3", stored)
+
+    def test_a_wake_for_a_body_with_no_readable_line_uses_the_wake_line(self):
+        self.send("\U0001f4e1 Not Sam \u00b7 echo only")
+        first_line = self.owner.wakes()[0]["text"].splitlines()[0]
+        self.assertIn("keyed update build-state", first_line)
+        self.assertNotIn("\u201c\u201d", first_line)
+
+    def test_a_wake_without_a_gist_shows_the_versions_first_sentence(self):
+        self.send("Build state: verifying G3. Details follow.")
+        wake = self.owner.wakes()[0]["text"]
+        self.assertEqual(wake.splitlines()[0],
+                         f"Message from {MARK} status-script: \u201cBuild state: verifying G3.\u201d")
+        self.assertNotIn("keyed update", wake.splitlines()[0])
 
     def test_the_wake_records_its_span_hash_and_marker_on_the_submitting_row(self):
         first = self.send()
