@@ -25,7 +25,8 @@
   wake, so the row rides the target's next turn;
 - 5 ``frame.build``, ``sanitize_user_prompt_text`` once, then ``header_sha`` over the span from
   header line 1 to the closing line, stored in the row. An explicit gist is cleaned and stored
-  on the row and quoted on the notice line; a wake line passes none, so that line uses the
+  on the row and quoted on the notice line. A keyed wake passes its version's gist (or that
+  version's first sentence); a deadline wake line passes none, so it uses the line's own
   fallback. The span below the notice line does not include the gist;
 - 6 ``client.deliver_sync``;
 - 7 ``record.update`` and the receipt.
@@ -469,7 +470,10 @@ def _queue_keyed(receipt, row, who, *, ctx, lister, scopes, shown) -> dict:
         sentence = f"{queued} It rides the wake already queued there."
     else:
         line = f"keyed update `{key}` from `{who.label}`; the current version follows."
-        text = _framed(message_id, who, line, ctx=ctx, reply_mode="none", scopes=scopes)
+        # The row shows this version's gist (or its first sentence), not the mechanical wake line
+        # (owner's choice). A newer version may replace it before the turn; the row keeps this one.
+        gist = row.get("gist") or frame.fallback_gist(row.get("body") or "")
+        text = _framed(message_id, who, line, ctx=ctx, reply_mode="none", scopes=scopes, gist=gist)
         record.update(message_id, header_sha=header_sha(text, message_id))
         was_open = _is_live(target, lister)
         outcome = client.deliver_sync(target, text, "queue", wake)
